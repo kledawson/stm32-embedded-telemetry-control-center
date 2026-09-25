@@ -6,3 +6,8 @@ venv/
 .codex-venv/
 recordings/
 config.json
+
+# STM32CubeIDE generated build output
+firmware/Debug/
+firmware/Release/
+firmware/.metadata/
