@@ -76,7 +76,8 @@ telemetry.py           Protocol model, checksum, parser, and encoder
 kinematics.py          Attitude filter and gravity compensation
 tests/                 Deterministic unit tests
 requirements.txt       Reproducible host dependencies
+firmware/              STM32CubeIDE project, FreeRTOS tasks, HAL, and MPU6050 code
 ROADMAP.md             Planned portfolio development
 ```
 
-The STM32CubeIDE project currently lives separately under `OneDrive/Documents/MPU6050_FreeRTOS`.
+The firmware tree is versioned in this repository under [`firmware/`](firmware/README.md). Generated `Debug/` and `Release/` outputs are intentionally excluded.
