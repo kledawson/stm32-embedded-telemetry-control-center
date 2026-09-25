@@ -77,4 +77,3 @@ def encode_telemetry(sample: TelemetrySample, spaced: bool = False) -> str:
         )
     )
     return f"{payload}|CHK:0x{calculate_checksum(payload):02X}"
-

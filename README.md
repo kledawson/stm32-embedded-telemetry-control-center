@@ -5,6 +5,7 @@ A desktop telemetry and digital-twin application for an STM32F401RE and MPU6050.
 ## Highlights
 
 - PyQt6 desktop dashboard with live plots, 3D attitude, force-vector visualization, and acceleration analytics
+- Responsive 3D relative-motion car demo driven by filtered linear acceleration
 - Hardware-free demo mode for development, interviews, screenshots, and screen recordings
 - XOR-validated ASCII telemetry protocol with compatibility for legacy spaced frames
 - Complementary pitch/roll filter, gyro deadband, bounded integration time, and orientation-aware gravity compensation
@@ -27,6 +28,12 @@ MPU6050 --I2C--> STM32F401RE / FreeRTOS
 ```
 
 `DemoWorker` implements the same signal interface as `SerialWorker`, so the complete UI can run without physical hardware.
+
+The **Motion Car Demo** is deliberately a bounded force-response visualization,
+not position tracking. A six-axis MPU6050 cannot separate every linear
+acceleration from gravity or provide drift-free position without additional
+references, so the car returns toward center when the applied acceleration
+stops.
 
 ## Run the dashboard
 

@@ -74,4 +74,3 @@ Use a picture-in-picture layout: board camera in one corner, screen capture as t
 - Add a boot-time firmware/version handshake and reject incompatible protocol versions cleanly
 - Stream device health such as task stack high-water marks and watchdog-reset cause
 - Add fault injection in demo/replay mode for corrupt checksums, delayed frames, and disconnects
-
