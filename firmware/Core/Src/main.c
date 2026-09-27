@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include "task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -64,7 +65,9 @@ DMA_HandleTypeDef hdma_usart2_tx;
 osThreadId_t TelemetryTaskHandle;
 const osThreadAttr_t TelemetryTask_attributes = {
   .name = "TelemetryTask",
-  .stack_size = 256 * 4,
+  // The checksummed float packet formatter needs additional headroom. Keep
+  // enough reserve for debug builds and future health/telemetry changes.
+  .stack_size = 384 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for StatusTask */
@@ -108,6 +111,8 @@ volatile uint8_t telemetry_paused = 0;      // 0 = Streaming, 1 = Paused
 volatile uint32_t telemetry_delay_ms = TELEMETRY_RATE_VISUAL_MS;
 volatile uint32_t command_rx_count = 0;
 volatile uint32_t command_rx_drop_count = 0;
+static uint32_t telemetry_sequence = 0;
+static const char *boot_reset_reason = "UNKNOWN";
 
 // Crash Detection Flag
 volatile uint8_t crash_logged = 0;
@@ -300,6 +305,14 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+
+  // Read sticky reset flags before peripheral initialization changes them.
+  if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST)) boot_reset_reason = "IWDG";
+  else if (__HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST)) boot_reset_reason = "WWDG";
+  else if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST)) boot_reset_reason = "SOFTWARE";
+  else if (__HAL_RCC_GET_FLAG(RCC_FLAG_PORRST)) boot_reset_reason = "POWER";
+  else if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST)) boot_reset_reason = "PIN";
+  __HAL_RCC_CLEAR_RESET_FLAGS();
 
   /* USER CODE END Init */
 
@@ -630,7 +643,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-	static char uart_buf[100];
+	static char uart_buf[128];
 	uint32_t next_wake = osKernelGetTickCount();
 
   /* Infinite loop */
@@ -662,11 +675,20 @@ void StartDefaultTask(void *argument)
 	            }
 
 	            // NOW it is 100% safe to overwrite the buffer
-	            int data_len = sprintf(uart_buf, "AX:%.2f|AY:%.2f|AZ:%.2f|GX:%.1f|GY:%.1f|GZ:%.1f", Ax, Ay, Az, Gx, Gy, Gz);
-	            uint8_t chk = calculate_checksum(uart_buf, data_len);
-	            int total_len = sprintf(uart_buf + data_len, "|CHK:0x%02X\r\n", chk);
-
-	            HAL_UART_Transmit_DMA(&huart2, (uint8_t *)uart_buf, data_len + total_len);
+	            int data_len = snprintf(uart_buf, sizeof(uart_buf),
+	                "AX:%.2f|AY:%.2f|AZ:%.2f|GX:%.1f|GY:%.1f|GZ:%.1f|SEQ:%lu",
+	                Ax, Ay, Az, Gx, Gy, Gz, (unsigned long)telemetry_sequence);
+	            if (data_len > 0 && data_len < (int)sizeof(uart_buf) - 12)
+	            {
+	                uint8_t chk = calculate_checksum(uart_buf, data_len);
+	                int suffix_len = snprintf(uart_buf + data_len, sizeof(uart_buf) - data_len,
+	                    "|CHK:0x%02X\r\n", chk);
+	                if (suffix_len > 0 && suffix_len < (int)(sizeof(uart_buf) - data_len))
+	                {
+	                    HAL_UART_Transmit_DMA(&huart2, (uint8_t *)uart_buf, data_len + suffix_len);
+	                    telemetry_sequence++;
+	                }
+	            }
 
 	            osMutexRelease(uartMutexHandle);
 	        }
@@ -697,7 +719,7 @@ void StartDefaultTask(void *argument)
 void StartStatusTask(void *argument)
 {
   /* USER CODE BEGIN StartStatusTask */
-  static char status_buf[100];
+  static char status_buf[224];
   uint8_t received_cmd = 0;
 
   /* Infinite loop */
@@ -852,10 +874,16 @@ void StartStatusTask(void *argument)
     {
         while (huart2.gState != HAL_UART_STATE_READY) { osDelay(1); }
 
-        int len = sprintf(status_buf,
-                          "[SYS STATUS]: RTOS Nominal | Watchdog Active | Rate: %lums | RX: %lu | Drop: %lu\r\n",
-                          telemetry_delay_ms, command_rx_count, command_rx_drop_count);
-        HAL_UART_Transmit_DMA(&huart2, (uint8_t *)status_buf, len);
+        unsigned long telemetry_stack = (unsigned long)uxTaskGetStackHighWaterMark((TaskHandle_t)TelemetryTaskHandle);
+        unsigned long status_stack = (unsigned long)uxTaskGetStackHighWaterMark((TaskHandle_t)StatusTaskHandle);
+        int len = snprintf(status_buf, sizeof(status_buf),
+            "[SYS STATUS]: RTOS Nominal | Watchdog Active | Rate: %lums | RX: %lu | Drop: %lu | Reset: %s | Stack: %lu,%lu | UID: %08lX%08lX%08lX\r\n",
+            (unsigned long)telemetry_delay_ms, (unsigned long)command_rx_count,
+            (unsigned long)command_rx_drop_count, boot_reset_reason,
+            telemetry_stack, status_stack, (unsigned long)HAL_GetUIDw0(),
+            (unsigned long)HAL_GetUIDw1(), (unsigned long)HAL_GetUIDw2());
+        if (len > 0 && len < (int)sizeof(status_buf))
+            HAL_UART_Transmit_DMA(&huart2, (uint8_t *)status_buf, len);
 
         osMutexRelease(uartMutexHandle);
     }

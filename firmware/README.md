@@ -12,7 +12,8 @@ Open `MPU6050_FreeRTOS.ioc` or `.project` in STM32CubeIDE and build the project 
 - Synchronized 14-byte MPU6050 burst reads over I2C
 - 200 Hz sensor configuration with a 30 ms host visual telemetry interval (about 33 Hz)
 - Checksummed UART telemetry packets and command handling
-- UART receive/drop counters included in the heartbeat
+- Per-frame sequence numbers for host-side packet-loss estimates
+- UART receive/drop counters, boot reset reason, device ID, and both task stack high-water marks in the heartbeat
 - Deadline-based telemetry scheduling with `osDelayUntil`
 - Flash-backed crash-log support
 

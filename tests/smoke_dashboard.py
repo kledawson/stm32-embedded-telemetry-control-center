@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PyQt6.QtCore import QPoint, QPointF, Qt
 from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QScrollArea
 from app import DemoWorker, TelemetryDashboard
 from session_io import load_session
 
@@ -27,6 +27,27 @@ window.activateWindow()
 QTest.qWait(300)
 temporary_directory = tempfile.TemporaryDirectory()
 try:
+    window.btn_calibrate.click()
+    dialog = window.calibration_dialog
+    assert dialog.isVisible(), "Top toolbar did not open calibration"
+    assert not dialog.start_button.isEnabled(), "Calibration was enabled without a live sensor"
+    if len(sys.argv) > 1:
+        output = Path(sys.argv[1])
+        output.mkdir(parents=True, exist_ok=True)
+        dialog.grab().save(str(output / 'calibration-wide.png'))
+    dialog.resize(360, 390)
+    QTest.qWait(100)
+    if len(sys.argv) > 1:
+        dialog.grab().save(str(output / 'calibration-narrow.png'))
+    dialog_area = dialog.findChild(QScrollArea)
+    dialog_scroll = dialog_area.verticalScrollBar()
+    assert dialog_scroll.maximum() > 0, "Calibration content could not scroll in a small window"
+    dialog.health_toggle.click()
+    assert dialog.health_details.parentWidget().isVisible(), "Device-health details did not expand"
+    dialog.profile_toggle.click()
+    QTest.qWait(30)
+    assert dialog_area.widget().width() <= dialog_area.viewport().width(), "Expanded details overflowed narrow dialog"
+    dialog.close()
     assert set(window.rail_sections) == {
         'STREAM CONTROL', 'SESSION CAPTURE + REPLAY', '3D ATTITUDE', 'MEMORY TOOLS', 'FIRMWARE TERMINAL'
     }, "Left rail did not create the expected collapsible panes"
@@ -57,6 +78,10 @@ try:
         window.rail_sections[title].toggle.click()
     window.toggle_connection()
     QTest.qWait(850)
+    window.btn_calibrate.click()
+    assert not dialog.start_button.isEnabled(), "Simulated data was presented as a calibratable device"
+    assert dialog.health_state.text() == 'Demo', "Demo data was presented as device health"
+    dialog.close()
     assert len(window.plot_times) > 5, "Demo stream did not arrive"
     recording_path = Path(temporary_directory.name) / "smoke-session.csv"
     assert window.start_recording_at_path(recording_path), "Demo recording did not start"
@@ -187,6 +212,9 @@ try:
     assert time.monotonic() - started < 1.5, "Slow demo would not stop promptly"
     window.start_replay(recorded_session)
     QTest.qWait(15)
+    window.btn_calibrate.click()
+    assert not dialog.start_button.isEnabled(), "Replay was presented as a live calibration source"
+    dialog.close()
     assert window.model_combo.itemText(0) == 'Jet Aircraft' and window.model_combo.currentIndex() == 0
     for model_index in (1, 2, 0):
         window.model_combo.setCurrentIndex(model_index)
@@ -230,7 +258,7 @@ try:
     window.render_frame(force=True)
     assert window.lbl_status.text() == 'OFFLINE'
     assert not window.btn_pause.isEnabled()
-    print('PASS: collapsible/scrollable left rail, terminal filters/health, demo record/replay/seek/step, plot/camera focus preservation, pause, R shortcut, memory commands, slow-rate disconnect, offline state')
+    print('PASS: calibration dialog resize/details, collapsible left rail, terminal filters/health, demo record/replay/seek/step, plot/camera focus, pause, shortcuts, memory commands, slow-rate disconnect, offline state')
 finally:
     temporary_directory.cleanup()
     window.close()

@@ -14,6 +14,7 @@ class TelemetrySample:
     gx: float
     gy: float
     gz: float
+    sequence: int | None = None
 
 
 # Whitespace is intentionally accepted around delimiters so older firmware and
@@ -25,6 +26,7 @@ TELEMETRY_PATTERN = re.compile(
     r"GX:\s*(?P<gx>[-+0-9.eE]+)\s*\|\s*"
     r"GY:\s*(?P<gy>[-+0-9.eE]+)\s*\|\s*"
     r"GZ:\s*(?P<gz>[-+0-9.eE]+)\s*\|\s*"
+    r"(?:SEQ:\s*(?P<sequence>\d+)\s*\|\s*)?"
     r"CHK:\s*0x(?P<checksum>[0-9A-Fa-f]{1,2})"
 )
 
@@ -58,6 +60,7 @@ def parse_telemetry_line(line: str) -> TelemetrySample | None:
             gx=float(match.group("gx")),
             gy=float(match.group("gy")),
             gz=float(match.group("gz")),
+            sequence=int(match.group("sequence")) if match.group("sequence") is not None else None,
         )
     except ValueError:
         return None
@@ -76,4 +79,41 @@ def encode_telemetry(sample: TelemetrySample, spaced: bool = False) -> str:
             f"GZ:{sample.gz:.1f}",
         )
     )
+    if sample.sequence is not None:
+        payload += f"|SEQ:{sample.sequence}"
     return f"{payload}|CHK:0x{calculate_checksum(payload):02X}"
+
+
+def is_checksum_failure(line: str) -> bool:
+    """Separate a syntactically valid bad checksum from a malformed frame."""
+    match = TELEMETRY_PATTERN.fullmatch(line.strip())
+    if match is None:
+        return False
+    payload, separator, _ = line.strip().partition("|CHK:")
+    return bool(separator) and calculate_checksum(payload) != int(match.group("checksum"), 16)
+
+
+@dataclass(frozen=True, slots=True)
+class FirmwareHealth:
+    reset_reason: str
+    telemetry_stack_words: int
+    status_stack_words: int
+    device_uid: str
+    command_rx: int
+    command_drop: int
+
+
+HEALTH_PATTERN = re.compile(
+    r"\[SYS STATUS\]:.*?RX:\s*(?P<rx>\d+)\s*\|\s*Drop:\s*(?P<drop>\d+)"
+    r"\s*\|\s*Reset:\s*(?P<reset>[A-Z]+)\s*\|\s*Stack:\s*"
+    r"(?P<telemetry>\d+),(?P<status>\d+)\s*\|\s*UID:\s*(?P<uid>[0-9A-Fa-f]{24})"
+)
+
+
+def parse_firmware_health(line: str) -> FirmwareHealth | None:
+    match = HEALTH_PATTERN.fullmatch(line.strip())
+    if match is None:
+        return None
+    return FirmwareHealth(match.group("reset"), int(match.group("telemetry")),
+                          int(match.group("status")), match.group("uid").upper(),
+                          int(match.group("rx")), int(match.group("drop")))

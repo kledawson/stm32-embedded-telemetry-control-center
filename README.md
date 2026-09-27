@@ -10,6 +10,8 @@ A desktop telemetry and digital-twin application for an STM32F401RE and MPU6050.
 - Collapsible, independently expandable left-rail panes with vertical scrolling when several control categories are open
 - Hardware-free demo mode for development, interviews, screenshots, and screen recordings
 - Durable CSV/JSON session recording of validated samples, derived attitude, and event markers
+- Guided gyro and six-face accelerometer calibration with local profile storage and live correction
+- Device-health view with checksum errors, sequence-based loss, receive jitter, throughput, reset cause, and FreeRTOS stack margins
 - Time-accurate replay at 0.25×, 0.5×, 1×, 2×, or 4× with Play/Pause, single-frame step, deterministic seek, and restart
 - Jet aircraft by default, with an orbital satellite and quadcopter drone as additional attitude models
 - XOR-validated ASCII telemetry protocol with compatibility for legacy spaced frames
@@ -63,13 +65,21 @@ python app.py
 
 Select **DEMO — No Hardware** and click **Connect** to exercise the UI without the board; this source intentionally animates the model with generated gyro data. Select the STM32 virtual COM port to use real telemetry; the dashboard requests the 30 ms visual rate after connecting.
 
+## Calibrate and inspect device health
+
+Connect a physical sensor, then select **Calibrate** in the top bar. Select **Start calibration**, leave the board still for the gyro check, then set each of its six faces upward in any order. Each face captures automatically after a stable hold. The progress tiles show which orientations are complete. Select **Save profile** after all six faces pass validation. Keep the live stream running and stop any recording before starting; the guide requests the 30 ms rate if needed.
+
+The profile is saved in the user's local application-data directory (`STM32TelemetryConsole/calibrations.json`) and applied to live dashboard processing and later recordings. It does not write coefficients to the STM32. New firmware reports its unique device ID so the correct profile reloads on reconnection; older firmware falls back to the serial port name. A recording retains the calibration ID captured when recording starts. Replays already contain processed samples and are not calibrated a second time.
+
+The same dialog shows the four most useful link metrics at a glance. Expand **Technical details** for validated/malformed frame counts, reset cause, task stack high-water marks, command drops, and device ID. Older firmware remains usable, but sequence-based loss and firmware-only fields display as unavailable until the updated firmware is flashed.
+
 ## Record and replay a session
 
 1. Connect either Demo or the physical board, then select **Start recording**.
 2. Choose a `.csv` destination. The app saves that data file and a matching `.json` manifest beside it when you select **Stop & save recording** or disconnect.
 3. Select **Open session for replay…** while disconnected. Use **Play/Pause** (or **P**) to control playback, **Step one frame** for a single sample, **Restart** to play from the beginning, the timeline to seek, and the snapping speed slider to choose 0.25×, 0.5×, 1×, 2×, or 4×.
 
-Starting a recording establishes a fresh attitude/event-processing baseline, and its first stored timestamp is always `0.0 s`; this keeps each capture self-contained and makes replay state reproducible. The CSV stores raw IMU readings, receive timestamps, calculated attitude and linear acceleration, motion state, and event markers. The JSON manifest stores format version, source, requested rate, application and firmware metadata, calibration identifier, and sample count. Seek rebuilds the attitude/event state from the beginning through the selected sample, so its resulting view matches linear playback instead of applying a stateless jump.
+Starting a recording establishes a fresh attitude/event-processing baseline, and its first stored timestamp is always `0.0 s`; this keeps each capture self-contained and makes replay state reproducible. The CSV stores IMU readings after any active host calibration, receive timestamps, calculated attitude and linear acceleration, motion state, and event markers. The JSON manifest stores format version, source, requested rate, application and firmware metadata, calibration identifier, and sample count. Seek rebuilds the attitude/event state from the beginning through the selected sample, so its resulting view matches linear playback instead of applying a stateless jump.
 
 Keyboard controls remain available throughout the window, including expanded views:
 
@@ -101,15 +111,21 @@ python tests/smoke_dashboard.py
 It requires the UI dependencies and a working desktop/OpenGL context. It never
 connects to physical hardware.
 
+With a connected board, run `python tests/live_serial_smoke.py COM3 --seconds 7 --gyro-check`
+to inspect the raw stream and test gyro stillness without saving a profile. Run
+`python tests/live_dashboard_smoke.py COM3` to check the desktop connection,
+calibration dialog, live health values, and disconnect behavior. These checks
+open and close the port, so close any other serial monitor first.
+
 ## Serial protocol
 
 Current firmware packets use this compact form:
 
 ```text
-AX:0.01|AY:-0.02|AZ:1.00|GX:0.1|GY:0.2|GZ:-0.3|CHK:0xNN
+AX:0.01|AY:-0.02|AZ:1.00|GX:0.1|GY:0.2|GZ:-0.3|SEQ:42|CHK:0xNN
 ```
 
-`CHK` is the 8-bit XOR of every character before `|CHK:`. The parser also accepts the older form containing spaces around delimiters.
+`CHK` is the 8-bit XOR of every character before `|CHK:`. `SEQ` increments for each transmitted sensor frame, allowing the desktop app to estimate packet loss. The parser also accepts older packets without `SEQ` and the legacy form containing spaces around delimiters. The five-second `[SYS STATUS]` line also carries reset reason, both task stack high-water marks, and a 96-bit device ID.
 
 Commands are single ASCII characters: `v` (30 ms), `f` (500 ms), `n` (1000 ms), `s` (2000 ms), `p` (pause/resume and sensor sleep/wake), `d` (dump crash snapshot), and `c` (erase/re-arm crash logging).
 
@@ -117,6 +133,8 @@ Commands are single ASCII characters: `v` (30 ms), `f` (500 ms), `n` (1000 ms), 
 
 ```text
 app.py                 PyQt6 UI and hardware/demo workers
+calibration.py         Stable-sample calibration, profile validation, and storage
+calibration_ui.py      Compact guided calibration and diagnostics dialog
 dashboard_ui.py        Panel styling and focus overlay
 motion_events.py       Measured motion/impact heuristics
 session_io.py          Versioned CSV/JSON session format, recorder, and validator

@@ -18,17 +18,23 @@ from kinematics import AttitudeEstimator
 from dashboard_ui import STYLE, Panel, CollapsibleSection, FocusOverlay, RailScrollArea
 from motion_events import MotionEvents
 from telemetry import TelemetrySample, parse_telemetry_line
+from telemetry import is_checksum_failure, parse_firmware_health
 from session_io import Session, SessionRecorder, SessionSample, load_session
+from calibration import CalibrationWizard, load_profile, save_profile
+from calibration_ui import CalibrationDialog
 
 # --- BACKGROUND SERIAL WORKER ---
 class SerialWorker(QThread):
     data_received = pyqtSignal(float, float, float, float, float, float, float)
     log_received = pyqtSignal(str)
+    sequence_received = pyqtSignal(object)
+    health_received = pyqtSignal(object)
     
     def __init__(self, port, baud=115200):
         super().__init__()
         self.port, self.baud, self.running, self.ser, self.last_time = port, baud, True, None, None
         self.invalid_frames = 0
+        self.checksum_failures = 0
         self.invalid_frame_examples = deque(maxlen=3)
         self.recovered_frames = 0
         self.synchronized = False
@@ -76,6 +82,7 @@ class SerialWorker(QThread):
             now = time.monotonic()
             dt = now - self.last_time if self.last_time else 0.03
             self.last_time = now
+            self.sequence_received.emit(sample.sequence)
             self.data_received.emit(sample.ax, sample.ay, sample.az, sample.gx, sample.gy, sample.gz, dt)
         elif line.startswith("AX:"):
             # Opening a serial port can start in the middle of an
@@ -84,10 +91,15 @@ class SerialWorker(QThread):
             if not self.synchronized:
                 return
             self.invalid_frames += 1
+            if is_checksum_failure(line):
+                self.checksum_failures += 1
             self.invalid_frame_examples.append(line)
             if self.invalid_frames == 1 or self.invalid_frames % 50 == 0:
                 self.log_received.emit(f"WARN >> REJECTED {self.invalid_frames} INVALID TELEMETRY FRAME(S)")
         else:
+            health = parse_firmware_health(line)
+            if health is not None or (line.startswith("[SYS STATUS]:") and "UID:" not in line):
+                self.health_received.emit(health)
             self.log_received.emit(f"TEL >> FIRMWARE · {line}")
 
     def send_cmd(self, cmd: str):
@@ -398,6 +410,7 @@ class TelemetryDashboard(QMainWindow):
         self.data = {axis: deque(maxlen=self.max_points) for axis in ('ax', 'ay', 'az', 'gx', 'gy', 'gz')}
         self.plot_times = deque(maxlen=self.max_points)
         self.sample_timestamps = deque(maxlen=120)
+        self.serial_interval_samples = deque(maxlen=120)
         self.frame_timestamps = deque(maxlen=120)
         self.latest_motion = None
         self.latest_net_g = self.peak_g = 0.0
@@ -421,6 +434,14 @@ class TelemetryDashboard(QMainWindow):
         self.terminal_rate_interval = 1.0
         self.terminal_following = True
         self._terminal_rendering = False
+        self.calibration_dialog = None
+        self.calibration_wizard = CalibrationWizard()
+        self.current_profile = None
+        self.firmware_health = None
+        self.serial_packets_seen = 0
+        self.sequenced_frames = 0
+        self.missing_packets = 0
+        self.last_sequence = None
         self.init_ui()
         self.shortcuts = []
         for key, button in self.button_map.items():
@@ -460,6 +481,10 @@ class TelemetryDashboard(QMainWindow):
         bar.setContentsMargins(14, 10, 14, 10)
         bar.addWidget(self.label("STM32  Telemetry Console", "brand"))
         bar.addStretch()
+        self.btn_calibrate = QPushButton("Calibrate")
+        self.btn_calibrate.setToolTip("Guided sensor calibration and live device diagnostics")
+        self.btn_calibrate.clicked.connect(self.open_calibration)
+        bar.addWidget(self.btn_calibrate)
         self.port_combo = QComboBox()
         self.port_combo.setMinimumWidth(200)
         self.refresh_ports()
@@ -926,6 +951,117 @@ class TelemetryDashboard(QMainWindow):
         self.port_combo.addItem("DEMO — No Hardware")
         self.port_combo.addItems([port.device for port in serial.tools.list_ports.comports()])
 
+    def is_live_serial(self):
+        return isinstance(self.worker, SerialWorker) and self.worker.isRunning()
+
+    def open_calibration(self):
+        if self.calibration_dialog is None:
+            self.calibration_dialog = CalibrationDialog(self)
+        self.calibration_dialog.refresh()
+        self.calibration_dialog.show()
+        self.calibration_dialog.raise_()
+        self.calibration_dialog.activateWindow()
+
+    def start_calibration(self):
+        if not self.is_live_serial() or self.paused or self.session_recorder is not None:
+            self.calibration_wizard.status = "Connect a live sensor, resume it, and stop recording first."
+        else:
+            if self.requested_interval > .05:
+                self.send_command('v')
+            self.calibration_wizard.start()
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.refresh()
+
+    def restart_calibration(self):
+        self.calibration_wizard.cancel()
+        self.start_calibration()
+
+    def save_calibration(self):
+        if not self.is_live_serial() or self.paused or self.session_recorder is not None:
+            return
+        key = (f"uid:{self.firmware_health.device_uid}" if self.firmware_health else
+               f"port:{self.port_combo.currentText()}")
+        try:
+            profile = self.calibration_wizard.profile(key)
+            save_profile(profile)
+        except (ValueError, OSError) as error:
+            self.calibration_wizard.status = str(error)
+            if self.calibration_dialog is not None:
+                self.calibration_dialog.refresh()
+            return
+        self.current_profile = profile
+        self.calibration_wizard.cancel("Calibration saved and applied to live data.")
+        self.reset_visual_session()
+        self.log_message(f"SYS >> CALIBRATION APPLIED · {profile.id}")
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.refresh()
+
+    def observe_sequence(self, sequence):
+        if sequence is None:
+            return
+        self.sequenced_frames += 1
+        if self.last_sequence is not None:
+            gap = (sequence - self.last_sequence) & 0xFFFFFFFF
+            if 1 < gap < 10000:
+                self.missing_packets += gap - 1
+        self.last_sequence = sequence
+
+    def receive_firmware_health(self, source, health):
+        if self.worker is not source:
+            return
+        self.firmware_health = health
+        key = f"uid:{health.device_uid}" if health else f"port:{self.port_combo.currentText()}"
+        profile = load_profile(key)
+        if profile != self.current_profile:
+            self.current_profile = profile
+            self.reset_visual_session()
+            self.log_message(f"SYS >> CALIBRATION {'LOADED · ' + profile.id if profile else 'NOT SAVED FOR THIS DEVICE'}")
+
+    def device_health_snapshot(self):
+        live = self.is_live_serial()
+        now = time.monotonic()
+        worker = self.worker if live else None
+        timestamps = [stamp for stamp in self.sample_timestamps if now - stamp <= 5.0] if live else []
+        intervals = [b - a for a, b in zip(timestamps, timestamps[1:])]
+        rate = (len(intervals) / (timestamps[-1] - timestamps[0])) if len(timestamps) > 1 else 0.0
+        jitter = sorted(abs(interval - self.requested_interval) * 1000
+                        for interval in self.serial_interval_samples)
+        p95 = jitter[min(len(jitter) - 1, math.ceil(.95 * len(jitter)) - 1)] if jitter else None
+        expected = self.sequenced_frames + self.missing_packets
+        loss = self.missing_packets / expected * 100 if expected else None
+        firmware = self.firmware_health if live else None
+        checksums = worker.checksum_failures if worker else 0
+        fresh = bool(timestamps) and now - timestamps[-1] <= max(1.5, 3 * self.requested_interval)
+        poor_link = bool(checksums or (loss is not None and loss > 1.0) or
+                         (p95 is not None and p95 > max(15, self.requested_interval * 500)))
+        low_stack = bool(firmware and min(firmware.telemetry_stack_words,
+                                          firmware.status_stack_words) < 32)
+        watchdog_reset = bool(firmware and firmware.reset_reason in ("IWDG", "WWDG"))
+        state = ("Replay" if self.is_replay_mode and self.worker is not None else
+                 "Demo" if self.is_demo_mode and self.worker is not None else
+                 "Connecting" if self.worker is not None and not live else
+                 "Offline" if not live else "Paused" if self.paused else
+                 "Waiting for data" if not fresh else "Needs attention" if poor_link or low_stack or watchdog_reset else "Good")
+        note = ("Connect a serial device for live diagnostics." if self.worker is None else
+                "Diagnostics require a live serial sensor." if not live else
+                "This firmware does not report sequence, reset, stack, or device ID yet." if firmware is None else
+                "Link counters reset on reconnect. Stack figures are minimum free words since boot.")
+        return {
+            "state": state, "checksum": str(checksums) if live else "—",
+            "loss": f"{loss:.2f}%" if loss is not None else "—",
+            "jitter": f"{p95:.1f} ms" if p95 is not None else "—",
+            "rate": f"{rate:.1f} frames/s" if live and fresh and not self.paused and rate else "—",
+            "frames": str(self.serial_packets_seen) if live else "—",
+            "missing": str(self.missing_packets) if live and self.sequenced_frames else "—",
+            "malformed": str(worker.invalid_frames - worker.checksum_failures) if worker else "—",
+            "reset": firmware.reset_reason if firmware else "—",
+            "telemetry_stack": f"{firmware.telemetry_stack_words} words" if firmware else "—",
+            "status_stack": f"{firmware.status_stack_words} words" if firmware else "—",
+            "command_drop": str(firmware.command_drop) if firmware else "—",
+            "identity": firmware.device_uid if firmware else "—",
+            "note": note,
+        }
+
     def reset_visual_session(self):
         """Reset derived dashboard state before switching data sources or seeking."""
         self.paused = False
@@ -934,6 +1070,7 @@ class TelemetryDashboard(QMainWindow):
         self.latest_motion = None
         self.latest_net_g = self.peak_g = 0.0
         self.sample_timestamps.clear()
+        self.serial_interval_samples.clear()
         self.plot_times.clear()
         self.frame_timestamps.clear()
         self.last_terminal_telemetry_at = 0.0
@@ -958,6 +1095,13 @@ class TelemetryDashboard(QMainWindow):
         self.is_replay_mode = False
         self.requested_interval = 0.03
         self.reset_visual_session()
+        self.calibration_wizard.cancel("Place the board on a stable surface to begin.")
+        self.firmware_health = None
+        self.serial_packets_seen = 0
+        self.sequenced_frames = 0
+        self.missing_packets = 0
+        self.last_sequence = None
+        self.current_profile = None
         self.btn_pause.setText("Pause telemetry  [P]")
         for key, button in self.rate_buttons.items():
             button.setChecked(key == 'v')
@@ -965,6 +1109,9 @@ class TelemetryDashboard(QMainWindow):
         self.worker = worker
         worker.data_received.connect(self.ingest_telemetry)
         worker.log_received.connect(self.log_message)
+        if isinstance(worker, SerialWorker):
+            worker.sequence_received.connect(self.observe_sequence)
+            worker.health_received.connect(lambda health, source=worker: self.receive_firmware_health(source, health))
         worker.finished.connect(lambda source=worker: self.source_finished(source))
         self.set_stream_controls(True)
         self.set_session_controls()
@@ -993,6 +1140,8 @@ class TelemetryDashboard(QMainWindow):
         """Start recording at a supplied path; shared by the dialog and desktop smoke test."""
         if self.session_recorder is not None or self.worker is None or self.is_replay_mode:
             return False
+        if self.calibration_wizard.stage in ("gyro", "faces", "ready"):
+            self.calibration_wizard.cancel("Recording started. Start calibration again afterward.")
         try:
             self.session_recorder = SessionRecorder(path, {
                 "application_version": "telemetry-console-prototype",
@@ -1000,7 +1149,8 @@ class TelemetryDashboard(QMainWindow):
                 "serial_port": None if self.is_demo_mode else self.port_combo.currentText(),
                 "requested_interval_ms": int(self.requested_interval * 1000),
                 "firmware_version": "unknown",
-                "calibration_id": "not-calibrated",
+                "calibration_id": self.current_profile.id if self.current_profile else "not-calibrated",
+                "calibration_device_key": self.current_profile.device_key if self.current_profile else None,
                 "processing_baseline": "attitude and motion-event state reset at recording start",
                 "recording_policy": "validated samples; derived attitude and events included",
             })
@@ -1183,6 +1333,9 @@ class TelemetryDashboard(QMainWindow):
         was_replay = self.is_replay_mode
         replay_completed = was_replay and source.next_index >= len(source.session.samples)
         self.worker = None
+        self.calibration_wizard.cancel("Connection ended. Reconnect to calibrate.")
+        self.current_profile = None
+        self.firmware_health = None
         source.deleteLater()
         self.paused = False
         self.is_replay_mode = False
@@ -1207,6 +1360,8 @@ class TelemetryDashboard(QMainWindow):
             return
         if self.worker is None or not self.worker.isRunning():
             return
+        if cmd in ('p', 'f', 'n', 's') and self.calibration_wizard.stage in ("gyro", "faces", "ready"):
+            self.calibration_wizard.cancel("Stream changed. Start calibration again when live data resumes.")
         try:
             self.worker.send_cmd(cmd)
         except Exception as error:
@@ -1216,6 +1371,7 @@ class TelemetryDashboard(QMainWindow):
         if cmd in intervals:
             self.requested_interval = intervals[cmd]
             self.sample_timestamps.clear()
+            self.serial_interval_samples.clear()
             for key, button in self.rate_buttons.items():
                 button.setChecked(key == cmd)
         elif cmd == 'p':
@@ -1225,6 +1381,7 @@ class TelemetryDashboard(QMainWindow):
             if not self.paused:
                 self.last_sample_at = time.monotonic()
                 self.sample_timestamps.clear()
+                self.serial_interval_samples.clear()
         self.log_message(f"SYS >> COMMAND SENT · {cmd.upper()}")
 
     def ingest_telemetry(self, ax, ay, az, gx, gy, gz, dt, source_time_s=None, record=True,
@@ -1234,6 +1391,16 @@ class TelemetryDashboard(QMainWindow):
         now = time.monotonic()
         if source_time_s is None:
             source_time_s = self.replay_position_s if self.is_replay_mode else now - self.session_started
+        if self.is_live_serial():
+            self.serial_packets_seen += 1
+            if self.serial_packets_seen > 1:
+                self.serial_interval_samples.append(dt)
+            raw_sample = TelemetrySample(ax, ay, az, gx, gy, gz)
+            self.calibration_wizard.feed(raw_sample, now)
+            if self.current_profile is not None:
+                corrected = self.current_profile.apply(raw_sample)
+                ax, ay, az, gx, gy, gz = (corrected.ax, corrected.ay, corrected.az,
+                                           corrected.gx, corrected.gy, corrected.gz)
         for key, value in zip(('ax', 'ay', 'az', 'gx', 'gy', 'gz'), (ax, ay, az, gx, gy, gz)):
             self.data[key].append(value)
         self.plot_times.append(source_time_s)
@@ -1284,6 +1451,8 @@ class TelemetryDashboard(QMainWindow):
             self.last_plot_render = now
         if force or now - self.last_stats_render >= .25:
             self.update_stats(now)
+            if self.calibration_dialog is not None and self.calibration_dialog.isVisible():
+                self.calibration_dialog.refresh()
             self.last_stats_render = now
 
     def render_attitude_twin(self):
