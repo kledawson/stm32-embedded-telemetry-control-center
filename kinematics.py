@@ -18,20 +18,6 @@ class MotionState:
     linear_az: float
 
 
-@dataclass(frozen=True, slots=True)
-class DriveState:
-    """Deliberately bounded relative-motion state for the dashboard car demo.
-
-    A six-axis IMU cannot yield reliable absolute position.  This model gives
-    acceleration an intuitive, visible effect while using damping and a hard
-    travel limit to keep integration drift from masquerading as navigation.
-    """
-
-    acceleration_g: float
-    velocity: float
-    position: float
-
-
 class AttitudeEstimator:
     """Complementary attitude filter with orientation-aware gravity removal."""
 
@@ -105,35 +91,6 @@ class AttitudeEstimator:
             linear_ay=linear[1],
             linear_az=linear[2],
         )
-
-
-class RelativeDriveModel:
-    """A responsive bounded force display, not an odometry estimator.
-
-    Position is mapped from the currently measured linear acceleration and
-    eases toward that target.  It therefore moves visibly during a push and
-    returns to center at rest instead of accumulating an inaccurate integral.
-    """
-
-    def __init__(self, response_time: float = 0.16, travel_limit: float = 8.0) -> None:
-        self.response_time = response_time
-        self.travel_limit = travel_limit
-        self.velocity = 0.0
-        self.position = 0.0
-
-    def reset(self) -> None:
-        self.velocity = 0.0
-        self.position = 0.0
-
-    def update(self, acceleration_g: float, dt: float) -> DriveState:
-        dt = min(max(float(dt), 0.001), 0.10)
-        acceleration_g = acceleration_g if abs(acceleration_g) >= 0.06 else 0.0
-        target_position = max(-self.travel_limit, min(self.travel_limit, acceleration_g * 14.0))
-        previous_position = self.position
-        self.position += (target_position - self.position) * (1.0 - math.exp(-dt / self.response_time))
-        self.velocity = (self.position - previous_position) / dt
-        return DriveState(acceleration_g, self.velocity, self.position)
-
 
 def _wrap_degrees(angle: float) -> float:
     return (angle + 180.0) % 360.0 - 180.0

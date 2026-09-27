@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from kinematics import AttitudeEstimator, RelativeDriveModel
+from kinematics import AttitudeEstimator
 from telemetry import TelemetrySample
 
 
@@ -42,22 +42,6 @@ class AttitudeEstimatorTests(unittest.TestCase):
         # still advances the estimate instead of snapping toward the accel angle.
         state = estimator.update(TelemetrySample(0, 2, 0, 100, 0, 0), 0.03)
         self.assertAlmostEqual(state.pitch, 3.0, delta=0.01)
-
-
-class RelativeDriveModelTests(unittest.TestCase):
-    def test_stationary_input_does_not_move_the_car(self):
-        drive = RelativeDriveModel()
-        state = drive.update(0.02, 0.03)
-        self.assertEqual((state.velocity, state.position), (0.0, 0.0))
-
-    def test_motion_is_bounded_and_can_be_recentered(self):
-        drive = RelativeDriveModel(travel_limit=1.0)
-        for _ in range(200):
-            state = drive.update(1.0, 0.1)
-        self.assertLessEqual(state.position, 1.0)
-        drive.reset()
-        self.assertEqual(drive.update(0.0, 0.03).position, 0.0)
-
 
 if __name__ == "__main__":
     unittest.main()
