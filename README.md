@@ -7,7 +7,11 @@ A desktop telemetry and digital-twin application for an STM32F401RE and MPU6050.
 - Single-screen PyQt6 dashboard with live acceleration/gyro plots, 3D attitude, and a compact motion-event summary
 - Expand either plot or the 3D view over a dimmed dashboard; the same live widget retains its zoom, camera, legends, and interactions
 - Persistent serial controls, stream-rate shortcuts, model selection, orientation reset, Flash commands, and a scrollable device log
+- Collapsible, independently expandable left-rail panes with vertical scrolling when several control categories are open
 - Hardware-free demo mode for development, interviews, screenshots, and screen recordings
+- Durable CSV/JSON session recording of validated samples, derived attitude, and event markers
+- Time-accurate replay at 0.25×, 0.5×, 1×, 2×, or 4× with Play/Pause, single-frame step, deterministic seek, and restart
+- Jet aircraft by default, with an orbital satellite and quadcopter drone as additional attitude models
 - XOR-validated ASCII telemetry protocol with compatibility for legacy spaced frames
 - Complementary pitch/roll filter, gyro deadband, bounded integration time, and orientation-aware gravity compensation
 - FreeRTOS telemetry and command tasks with ISR-to-queue command delivery and mutex-protected DMA UART output
@@ -21,14 +25,15 @@ MPU6050 --I2C--> STM32F401RE / FreeRTOS
                          |
                  checksummed UART
                          |
-              SerialWorker (QThread)
+      SerialWorker / DemoWorker / ReplayWorker
                          |
        parser --> attitude estimator --> PyQt6 UI
                          |
+       recorder --> CSV + JSON manifest
             plots / 3D twin / analytics
 ```
 
-`DemoWorker` implements the same signal interface as `SerialWorker`, so the complete UI can run without physical hardware.
+`DemoWorker` and `ReplayWorker` feed the same dashboard pipeline as `SerialWorker`, so the complete UI can run without physical hardware or replay recorded field data.
 
 **Motion Events** summarizes measured activity: stationary, rotating, active
 motion, shaking, and impact. Impacts use a 2 g threshold with hysteresis and a
@@ -58,10 +63,18 @@ python app.py
 
 Select **DEMO — No Hardware** and click **Connect** to exercise the UI without the board; this source intentionally animates the model with generated gyro data. Select the STM32 virtual COM port to use real telemetry; the dashboard requests the 30 ms visual rate after connecting.
 
+## Record and replay a session
+
+1. Connect either Demo or the physical board, then select **Start recording**.
+2. Choose a `.csv` destination. The app saves that data file and a matching `.json` manifest beside it when you select **Stop & save recording** or disconnect.
+3. Select **Open session for replay…** while disconnected. Use **Play/Pause** (or **P**) to control playback, **Step one frame** for a single sample, **Restart** to play from the beginning, the timeline to seek, and the snapping speed slider to choose 0.25×, 0.5×, 1×, 2×, or 4×.
+
+Starting a recording establishes a fresh attitude/event-processing baseline, and its first stored timestamp is always `0.0 s`; this keeps each capture self-contained and makes replay state reproducible. The CSV stores raw IMU readings, receive timestamps, calculated attitude and linear acceleration, motion state, and event markers. The JSON manifest stores format version, source, requested rate, application and firmware metadata, calibration identifier, and sample count. Seek rebuilds the attitude/event state from the beginning through the selected sample, so its resulting view matches linear playback instead of applying a stateless jump.
+
 Keyboard controls remain available throughout the window, including expanded views:
 
 - **V / F / N / S:** 33 Hz / 2 Hz / 1 Hz / 0.5 Hz stream rate.
-- **P:** pause/resume the stream. **R:** zero the orientation estimate.
+- **P:** pause/resume the current live stream or replay. **R:** zero the orientation estimate.
 - **D:** dump the Flash snapshot. **C:** erase/re-arm Flash Sector 5.
 - **Escape:** return from an expanded view.
 
@@ -78,7 +91,7 @@ The core tests use only Python's standard library:
 python -m unittest discover -s tests -v
 ```
 
-An optional desktop check exercises demo streaming, focus/restore, camera and
+An optional desktop check exercises demo streaming, session record/replay/seek/frame-step, focus/restore, camera and
 plot-range preservation, pause, the R shortcut, and disconnect at slow rates:
 
 ```powershell
@@ -106,6 +119,7 @@ Commands are single ASCII characters: `v` (30 ms), `f` (500 ms), `n` (1000 ms), 
 app.py                 PyQt6 UI and hardware/demo workers
 dashboard_ui.py        Panel styling and focus overlay
 motion_events.py       Measured motion/impact heuristics
+session_io.py          Versioned CSV/JSON session format, recorder, and validator
 telemetry.py           Protocol model, checksum, parser, and encoder
 kinematics.py          Attitude filter and gravity compensation
 tests/                 Deterministic unit tests

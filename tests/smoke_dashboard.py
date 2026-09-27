@@ -5,15 +5,18 @@ hardware. Core CI remains standard-library-only.
 """
 
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, QPointF, Qt
+from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 from app import DemoWorker, TelemetryDashboard
+from session_io import load_session
 
 
 QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
@@ -22,10 +25,46 @@ window = TelemetryDashboard()
 window.show()
 window.activateWindow()
 QTest.qWait(300)
+temporary_directory = tempfile.TemporaryDirectory()
 try:
+    assert set(window.rail_sections) == {
+        'STREAM CONTROL', 'SESSION CAPTURE + REPLAY', '3D ATTITUDE', 'MEMORY TOOLS', 'FIRMWARE TERMINAL'
+    }, "Left rail did not create the expected collapsible panes"
+    session_pane = window.rail_sections['SESSION CAPTURE + REPLAY']
+    session_pane.toggle.click()
+    assert not session_pane.content.isVisible(), "Session pane did not collapse"
+    session_pane.toggle.click()
+    assert session_pane.content.isVisible(), "Session pane did not expand"
+    for title in ('3D ATTITUDE', 'MEMORY TOOLS', 'FIRMWARE TERMINAL'):
+        pane = window.rail_sections[title]
+        pane.toggle.click()
+        assert pane.content.isVisible(), f"{title} pane did not expand"
+    window.resize(1060, 730)
+    QTest.qWait(100)
+    rail_scroll = window.rail_scroll.verticalScrollBar()
+    assert rail_scroll.maximum() > 0, "Expanded left rail did not become scrollable"
+    rail_scroll.setValue(0)
+    wheel = QWheelEvent(
+        QPointF(4, 4), QPointF(4, 4), QPoint(), QPoint(0, -120),
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate, False,
+    )
+    QApplication.sendEvent(window.btn_clear, wheel)
+    assert rail_scroll.value() > 0, "Wheel input over a rail control did not scroll the sidebar"
+    rail_scroll.setValue(rail_scroll.maximum())
+    assert rail_scroll.value() == rail_scroll.maximum(), "Left rail could not scroll to lower controls"
+    for title in ('3D ATTITUDE', 'MEMORY TOOLS', 'FIRMWARE TERMINAL'):
+        window.rail_sections[title].toggle.click()
     window.toggle_connection()
     QTest.qWait(850)
     assert len(window.plot_times) > 5, "Demo stream did not arrive"
+    recording_path = Path(temporary_directory.name) / "smoke-session.csv"
+    assert window.start_recording_at_path(recording_path), "Demo recording did not start"
+    QTest.qWait(300)
+    window.stop_recording()
+    recorded_session = load_session(recording_path)
+    assert len(recorded_session.samples) >= 5, "Recorded session was unexpectedly short"
+    assert recorded_session.metadata["source"] == "demo", "Session metadata lost the data source"
     assert "SYS" in window.terminal.toPlainText(), "System messages did not reach Firmware Terminal"
     assert "TEL" in window.terminal.toPlainText(), "Telemetry messages did not reach Firmware Terminal"
     assert window.terminal_records, "Terminal did not retain structured messages"
@@ -146,10 +185,53 @@ try:
     started = time.monotonic()
     window.disconnect_source()
     assert time.monotonic() - started < 1.5, "Slow demo would not stop promptly"
+    window.start_replay(recorded_session)
+    QTest.qWait(15)
+    assert window.model_combo.itemText(0) == 'Jet Aircraft' and window.model_combo.currentIndex() == 0
+    for model_index in (1, 2, 0):
+        window.model_combo.setCurrentIndex(model_index)
+        assert window.active_mesh is not None, 'A built-in model failed to load'
+    window.rail_sections['SESSION CAPTURE + REPLAY'].toggle.click()
+    assert not window.rail_sections['SESSION CAPTURE + REPLAY'].content.isVisible()
+    window.rail_sections['SESSION CAPTURE + REPLAY'].toggle.click()
+    assert window.btn_step.isEnabled(), "Replay controls did not survive pane collapse/expand"
+    window.btn_play_replay.click()
+    assert window.paused and 'Play' in window.btn_play_replay.text(), "Replay did not pause"
+    for index, speed in enumerate((.25, .5, 1., 2., 4.)):
+        window.replay_speed_slider.setValue(index)
+        assert window.worker.speed == speed and window.lbl_replay_speed.text() == f'{speed:g}×'
+    before_step = len(window.plot_times)
+    window.step_replay()
+    QTest.qWait(50)
+    assert len(window.plot_times) > before_step, "Frame-step did not ingest a replay sample"
+    window.replay_slider.setValue(500)
+    window.commit_replay_seek()
+    assert window.replay_position_s > 0, "Timeline seek did not change replay position"
+    assert window.paused, "Seeking changed the replay pause state"
+    position_before_play = window.replay_position_s
+    window.btn_play_replay.click()
+    assert not window.paused and 'Pause' in window.btn_play_replay.text(), "Replay did not resume"
+    QTest.qWait(70)
+    assert window.replay_position_s > position_before_play, "Replay made no progress after resuming"
+    window.replay_speed_slider.setValue(2)
+    window.btn_restart_replay.click()
+    QTest.qWait(20)
+    window.activateWindow()
+    window.btn_connect.setFocus()
+    QTest.keyClick(window, Qt.Key.Key_P)
+    QTest.qWait(20)
+    assert window.paused and 'Play' in window.btn_play_replay.text(), "P did not pause replay"
+    QTest.keyClick(window, Qt.Key.Key_P)
+    QTest.qWait(20)
+    assert not window.paused and 'Pause' in window.btn_play_replay.text(), "P did not resume replay"
+    window.btn_restart_replay.click()
+    assert window.replay_position_s == 0 and not window.paused, "Restart did not play from the beginning"
+    window.disconnect_source()
     window.render_frame(force=True)
     assert window.lbl_status.text() == 'OFFLINE'
     assert not window.btn_pause.isEnabled()
-    print('PASS: terminal filters/health, demo, plot/camera focus preservation, pause, R shortcut, memory commands, slow-rate disconnect, offline state')
+    print('PASS: collapsible/scrollable left rail, terminal filters/health, demo record/replay/seek/step, plot/camera focus preservation, pause, R shortcut, memory commands, slow-rate disconnect, offline state')
 finally:
+    temporary_directory.cleanup()
     window.close()
     app.processEvents()

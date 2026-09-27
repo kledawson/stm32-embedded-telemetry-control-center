@@ -1,14 +1,16 @@
 """Dashboard surfaces and a focus overlay that preserves the live widgets."""
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtGui import QColor, QPainter
-from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget
 
 
 STYLE = """
 QMainWindow, QWidget#console { background: #0b0e14; color: #edf3fa; }
 QWidget { color: #edf3fa; font-family: 'Segoe UI'; font-size: 12px; }
 QFrame#toolbar, QFrame#rail { background: #111721; border: 1px solid #293444; border-radius: 8px; }
+QScrollArea#railScroll { background: #111721; border: 1px solid #293444; border-radius: 8px; }
+QScrollArea#railScroll > QWidget > QWidget { background: #111721; }
 QFrame#panel, QFrame#metric { background: #151c28; border: 1px solid #2c3748; border-radius: 8px; }
 QFrame#healthPanel { background: #131d29; border: 1px solid #2c3748; border-radius: 6px; }
 QFrame#focusCard { background: #151c28; border: 1px solid #637e90; border-radius: 10px; }
@@ -31,6 +33,13 @@ QPushButton#terminalFilter { color: #aebfd0; background: #111a26; font-size: 11p
 QPushButton#terminalFilter:checked { color: #effbff; background: #1d5264; border-color: #55b7cd; }
 QToolButton#healthToggle { color: #a9bbcb; background: transparent; border: none; font-size: 10px; font-weight: 600; padding: 2px 0; }
 QToolButton#healthToggle:hover { color: #edf3fa; }
+QToolButton#sectionToggle { color: #91a7b9; background: transparent; border: none; border-radius: 4px; font-size: 10px; font-weight: 600; padding: 3px 2px; text-align: left; }
+QToolButton#sectionToggle:checked { color: #dce8f2; }
+QToolButton#sectionToggle:hover { color: #edf3fa; background: #192633; }
+QScrollBar:vertical { background: transparent; width: 6px; margin: 4px 1px; }
+QScrollBar::handle:vertical { background: #314657; min-height: 20px; border-radius: 3px; }
+QScrollBar::handle:vertical:hover { background: #55b7cd; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
 QPushButton#resumeLive { color: #edf3fa; background: #1d5264; border: 1px solid #55b7cd; border-radius: 10px; padding: 4px 9px; font-size: 10px; font-weight: 600; }
 QSlider::groove:horizontal { height: 4px; background: #2a3a4c; border-radius: 2px; }
 QSlider::handle:horizontal { width: 12px; margin: -5px 0; background: #55b7cd; border: 1px solid #87d7e5; border-radius: 6px; }
@@ -67,6 +76,69 @@ class Panel(QFrame):
             header.addWidget(self.expand_button)
         self.box.addLayout(header)
         self.box.addWidget(content, 1)
+
+
+class CollapsibleSection(QFrame):
+    """A compact left-rail pane whose content can be expanded independently."""
+
+    def __init__(self, title, content, expanded=False):
+        super().__init__()
+        self.setObjectName("railSection")
+        self.content = content
+        self.toggle = QToolButton()
+        self.toggle.setObjectName("sectionToggle")
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.setFixedHeight(24)
+        self.toggle.setToolTip(f"Show or hide {title.title()} controls")
+        self.toggle.toggled.connect(self.set_expanded)
+        self.box = QVBoxLayout(self)
+        self.box.setContentsMargins(0, 0, 0, 0)
+        self.box.setSpacing(2)
+        self.box.addWidget(self.toggle)
+        self.box.addWidget(content)
+        self.set_expanded(expanded)
+
+    def set_expanded(self, expanded):
+        self.content.setVisible(expanded)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+
+
+class RailScrollArea(QScrollArea):
+    """A control rail that keeps mouse-wheel navigation reliable over its children."""
+
+    def enable_wheel_navigation(self):
+        """Route wheel gestures from nested buttons/panes to the vertical bar."""
+        if self.widget() is None:
+            return
+        self.viewport().installEventFilter(self)
+        self.widget().installEventFilter(self)
+        for child in self.widget().findChildren(QWidget):
+            child.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Wheel:
+            scrollbar = self.verticalScrollBar()
+            if scrollbar.maximum() > scrollbar.minimum():
+                pixel_delta = event.pixelDelta().y()
+                angle_delta = event.angleDelta().y()
+                if pixel_delta:
+                    distance = -pixel_delta
+                elif angle_delta:
+                    # One wheel notch moves far enough to reveal the next
+                    # compact pane, rather than requiring many tiny turns.
+                    distance = -round(angle_delta / 120) * max(48, scrollbar.singleStep() * 3)
+                else:
+                    return super().eventFilter(watched, event)
+                previous = scrollbar.value()
+                scrollbar.setValue(previous + distance)
+                if scrollbar.value() != previous:
+                    event.accept()
+                    return True
+        return super().eventFilter(watched, event)
 
 
 class FocusOverlay(QWidget):

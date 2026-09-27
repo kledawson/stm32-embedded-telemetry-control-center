@@ -15,11 +15,11 @@ The goal is a polished, demonstrable embedded/desktop system with enough softwar
 
 ## Phase 1 — Session data and reproducibility
 
-- Record validated raw samples, derived attitude, linear acceleration, timestamps, and event markers to CSV
-- Add a session metadata sidecar containing firmware version, sample rate, calibration identifier, and application version
-- Load recorded sessions and replay them at 0.5x, 1x, 2x, and 4x
-- Add seek, pause, frame-step, and timeline controls
-- Include deterministic replay files in integration tests
+- Completed prototype: record validated raw samples, derived attitude, linear acceleration, timestamps, and event markers to CSV
+- Completed prototype: write a versioned JSON manifest with application/firmware metadata, source, sample rate, and calibration identifier
+- Completed prototype: load and replay sessions at 0.25x, 0.5x, 1x, 2x, and 4x, with seek, Play/Pause, timeline, frame-step, and restart controls
+- Completed prototype: validate session round trips and exercise record/replay/seek/frame-step in the desktop smoke test
+- Next polish: add a small, checked-in real-device fixture and an explicit application/firmware build version handshake
 
 **Portfolio value:** data pipelines, serialization, state machines, reproducible debugging, and separation between live and replay data sources.
 

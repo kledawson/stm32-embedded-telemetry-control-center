@@ -1,5 +1,6 @@
 import sys, time, math, serial, html
-from threading import Event
+from bisect import bisect_left, bisect_right
+from threading import Event, Lock
 from collections import deque
 import serial.tools.list_ports
 import numpy as np
@@ -14,9 +15,10 @@ import pyqtgraph.opengl as gl
 from stl import mesh as stl_mesh
 
 from kinematics import AttitudeEstimator
-from dashboard_ui import STYLE, Panel, FocusOverlay
+from dashboard_ui import STYLE, Panel, CollapsibleSection, FocusOverlay, RailScrollArea
 from motion_events import MotionEvents
 from telemetry import TelemetrySample, parse_telemetry_line
+from session_io import Session, SessionRecorder, SessionSample, load_session
 
 # --- BACKGROUND SERIAL WORKER ---
 class SerialWorker(QThread):
@@ -27,29 +29,28 @@ class SerialWorker(QThread):
         super().__init__()
         self.port, self.baud, self.running, self.ser, self.last_time = port, baud, True, None, None
         self.invalid_frames = 0
+        self.invalid_frame_examples = deque(maxlen=3)
+        self.recovered_frames = 0
+        self.synchronized = False
 
     def run(self):
         try:
             self.ser = serial.Serial(self.port, self.baud, timeout=0.05)
             self.log_received.emit(f"SYS >> UART CONNECTED · {self.port} · {self.baud} BAUD")
             self.last_time = time.monotonic()
-            
+            receive_buffer = bytearray()
             while self.running and self.ser.is_open:
                 if self.ser.in_waiting:
-                    line = self.ser.readline().decode('utf-8', errors='replace').strip()
-                    if not line: continue
-                    sample = parse_telemetry_line(line)
-                    if sample is not None:
-                        now = time.monotonic()
-                        dt = now - self.last_time if self.last_time else 0.03
-                        self.last_time = now
-                        self.data_received.emit(sample.ax, sample.ay, sample.az, sample.gx, sample.gy, sample.gz, dt)
-                    elif line.startswith("AX:"):
-                        self.invalid_frames += 1
-                        if self.invalid_frames == 1 or self.invalid_frames % 50 == 0:
-                            self.log_received.emit(f"WARN >> REJECTED {self.invalid_frames} INVALID TELEMETRY FRAME(S)")
-                    else:
-                        self.log_received.emit(f"TEL >> FIRMWARE · {line}")
+                    receive_buffer.extend(self.ser.read(self.ser.in_waiting))
+                    while b'\n' in receive_buffer:
+                        raw_line, _, remaining = receive_buffer.partition(b'\n')
+                        receive_buffer = bytearray(remaining)
+                        self._handle_line(raw_line.decode('utf-8', errors='replace').strip())
+                    # Bound memory if a disconnected/noisy device never emits
+                    # a terminator; keeping its tail gives a later valid frame
+                    # a chance to resynchronize.
+                    if len(receive_buffer) > 4096:
+                        receive_buffer = receive_buffer[-512:]
                 time.sleep(0.001)
         except Exception as e:
             if self.running:
@@ -57,6 +58,37 @@ class SerialWorker(QThread):
         finally:
             if self.ser and self.ser.is_open:
                 self.ser.close()
+
+    def _handle_line(self, line: str):
+        if not line:
+            return
+        sample = parse_telemetry_line(line)
+        if sample is None:
+            # If an unterminated prefix is followed by a complete telemetry
+            # packet, retain the final packet instead of rejecting both.
+            final_packet_start = line.rfind("AX:")
+            if final_packet_start > 0:
+                sample = parse_telemetry_line(line[final_packet_start:])
+                if sample is not None:
+                    self.recovered_frames += 1
+        if sample is not None:
+            self.synchronized = True
+            now = time.monotonic()
+            dt = now - self.last_time if self.last_time else 0.03
+            self.last_time = now
+            self.data_received.emit(sample.ax, sample.ay, sample.az, sample.gx, sample.gy, sample.gz, dt)
+        elif line.startswith("AX:"):
+            # Opening a serial port can start in the middle of an
+            # already-transmitted line.  Discard pre-sync fragments rather
+            # than presenting a false packet-integrity fault.
+            if not self.synchronized:
+                return
+            self.invalid_frames += 1
+            self.invalid_frame_examples.append(line)
+            if self.invalid_frames == 1 or self.invalid_frames % 50 == 0:
+                self.log_received.emit(f"WARN >> REJECTED {self.invalid_frames} INVALID TELEMETRY FRAME(S)")
+        else:
+            self.log_received.emit(f"TEL >> FIRMWARE · {line}")
 
     def send_cmd(self, cmd: str):
         if self.ser and self.ser.is_open:
@@ -131,6 +163,120 @@ class DemoWorker(QThread):
         self.running = False
         self.stop_event.set()
 
+
+class ReplayWorker(QThread):
+    """Emit recorded samples through the same signal contract as live sources."""
+
+    data_received = pyqtSignal(float, float, float, float, float, float, float)
+    log_received = pyqtSignal(str)
+    progress_received = pyqtSignal(float, float)
+    step_started = pyqtSignal()
+    step_completed = pyqtSignal()
+
+    def __init__(self, session: Session):
+        super().__init__()
+        self.session = session
+        self.running = True
+        self.paused = False
+        self.speed = 1.0
+        self.next_index = 0
+        self._seek_generation = 0
+        self.step_requested = False
+        self._lock = Lock()
+        self._wake_event = Event()
+
+    @property
+    def duration_s(self):
+        return self.session.duration_s
+
+    def send_cmd(self, cmd: str):
+        if cmd == 'p':
+            with self._lock:
+                self.paused = not self.paused
+            self.log_received.emit(f"SYS >> REPLAY {'PAUSED' if self.paused else 'RESUMED'}")
+        self._wake_event.set()
+
+    def set_speed(self, speed: float):
+        with self._lock:
+            self.speed = float(speed)
+        self.log_received.emit(f"SYS >> REPLAY SPEED · {self.speed:g}×")
+        self._wake_event.set()
+
+    def set_next_index(self, index: int):
+        with self._lock:
+            self.next_index = max(0, min(index, len(self.session.samples)))
+            self._seek_generation += 1
+        self._wake_event.set()
+
+    def set_paused(self, paused: bool):
+        with self._lock:
+            self.paused = paused
+        self._wake_event.set()
+
+    def request_step(self):
+        with self._lock:
+            self.paused = True
+            self.step_requested = True
+        self._wake_event.set()
+
+    def run(self):
+        self.log_received.emit(
+            f"SYS >> REPLAY SOURCE ACTIVE · {len(self.session.samples)} SAMPLES · {self.duration_s:.1f} S"
+        )
+        previous_timestamp = None
+        observed_seek_generation = 0
+        while self.running:
+            with self._lock:
+                index = self.next_index
+                paused = self.paused
+                stepped = self.step_requested
+                if observed_seek_generation != self._seek_generation:
+                    previous_timestamp = None
+                    observed_seek_generation = self._seek_generation
+                if stepped:
+                    self.step_requested = False
+            if index >= len(self.session.samples):
+                self.log_received.emit("SYS >> REPLAY COMPLETE")
+                return
+            if paused and not stepped:
+                self._wake_event.wait(.05)
+                self._wake_event.clear()
+                continue
+
+            sample = self.session.samples[index]
+            if paused and stepped:
+                self.step_started.emit()
+            if not paused and previous_timestamp is not None:
+                with self._lock:
+                    speed = self.speed
+                delay = max(0.0, sample.timestamp_s - previous_timestamp) / max(speed, .1)
+                interrupted = self._wake_event.wait(delay)
+                self._wake_event.clear()
+                if not self.running:
+                    return
+                if interrupted:
+                    continue
+            with self._lock:
+                # A seek can arrive between observing the index and emitting;
+                # discard this stale frame so the UI never jumps backward.
+                if index != self.next_index:
+                    continue
+                self.next_index += 1
+            self.progress_received.emit(sample.timestamp_s, self.duration_s)
+            self.data_received.emit(sample.ax_g, sample.ay_g, sample.az_g,
+                                    sample.gx_dps, sample.gy_dps, sample.gz_dps,
+                                    sample.received_dt_s)
+
+            if paused:
+                if stepped:
+                    self.step_completed.emit()
+                continue
+            previous_timestamp = sample.timestamp_s
+
+    def stop(self):
+        self.running = False
+        self._wake_event.set()
+
 # --- PROCEDURAL 3D MESH BUILDERS ---
 def create_mesh(verts, faces, color):
     face_colors = np.tile(np.array(color, dtype=np.float32), (len(faces), 1))
@@ -146,16 +292,87 @@ def create_stl_mesh(path):
     faces = np.arange(len(vertices), dtype=np.int32).reshape(-1, 3)
     return create_mesh(vertices, faces, (0.25, 0.75, 1.0, 0.95))
 
-def create_cubesat_mesh():
-    verts = [[-2,-1.5,-1],[2,-1.5,-1],[2,1.5,-1],[-2,1.5,-1],[-2,-1.5,1],[2,-1.5,1],[2,1.5,1],[-2,1.5,1]]
-    faces = [[0,1,2],[0,2,3],[4,5,6],[4,6,7],[0,1,5],[0,5,4],[2,3,7],[2,7,6],[0,3,7],[0,7,4],[1,2,6],[1,6,5]]
-    return create_mesh(verts, faces, (0.1, 0.6, 1.0, 0.8))
+class ColoredMesh:
+    """Small triangle builder so model components have recognizable colors."""
+
+    def __init__(self):
+        self.triangles = []
+        self.colors = []
+
+    def quad(self, a, b, c, d, color):
+        self.triangles.extend(((a, b, c), (a, c, d)))
+        self.colors.extend((color, color))
+
+    def box(self, x0, x1, y0, y1, z0, z1, color):
+        points = ((x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+                  (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1))
+        for face in ((0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4),
+                     (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)):
+            self.quad(*(points[index] for index in face), color)
+
+    def disc(self, x, y, z, radius, color, segments=12):
+        for index in range(segments):
+            first = 2 * math.pi * index / segments
+            second = 2 * math.pi * (index + 1) / segments
+            self.triangles.append(((x, y, z),
+                                   (x + radius * math.cos(first), y + radius * math.sin(first), z),
+                                   (x + radius * math.cos(second), y + radius * math.sin(second), z)))
+            self.colors.append(color)
+
+    def item(self):
+        vertices = np.asarray(self.triangles, dtype=np.float32).reshape(-1, 3)
+        faces = np.arange(len(vertices), dtype=np.int32).reshape(-1, 3)
+        return gl.GLMeshItem(vertexes=vertices, faces=faces,
+                             faceColors=np.asarray(self.colors, dtype=np.float32),
+                             shader='shaded', drawEdges=True, edgeColor=(.14, .23, .32, .55))
 
 def create_satellite_mesh():
-    verts = [[-1.5,-1.5,-1.5],[1.5,-1.5,-1.5],[1.5,1.5,-1.5],[-1.5,1.5,-1.5],[-1.5,-1.5,1.5],[1.5,-1.5,1.5],[1.5,1.5,1.5],[-1.5,1.5,1.5],
-             [-8.0,-1.0,0.0],[-1.5,-1.0,0.0],[-1.5,1.0,0.0],[-8.0,1.0,0.0],[1.5,-1.0,0.0],[8.0,-1.0,0.0],[8.0,1.0,0.0],[1.5,1.0,0.0]]
-    faces = [[0,1,2],[0,2,3],[4,5,6],[4,6,7],[0,1,5],[0,5,4],[2,3,7],[2,7,6],[0,3,7],[0,7,4],[1,2,6],[1,6,5],[8,9,10],[8,10,11],[12,13,14],[12,14,15]]
-    return create_mesh(verts, faces, (1.0, 0.6, 0.0, 0.95))
+    model = ColoredMesh()
+    silver = (.68, .75, .79, 1)
+    gold = (.82, .62, .24, 1)
+    blue = (.09, .27, .58, 1)
+    model.box(-1.4, 1.4, -1.1, 1.1, -1.15, 1.15, gold)  # equipment bus
+    model.box(-1.1, 1.1, -1.14, -1.1, -.85, .85, silver)
+    model.box(-1.65, -1.4, -.32, .32, -.2, .2, silver)
+    model.box(1.4, 1.65, -.32, .32, -.2, .2, silver)
+    for side in (-1, 1):
+        for panel in range(2):
+            inner = 1.65 + panel * 2.9
+            outer = inner + 2.75
+            x0, x1 = (inner, outer) if side > 0 else (-outer, -inner)
+            model.box(x0, x1, -1.2, 1.2, -.12, .12, blue)
+            # Pale cell grid makes the wings read as photovoltaic panels.
+            for step in range(1, 4):
+                x = x0 + (x1 - x0) * step / 4
+                model.box(x - .025, x + .025, -1.2, 1.2, .13, .15, silver)
+            model.box(x0, x1, -.025, .025, .13, .15, silver)
+    model.box(-.08, .08, -.08, .08, 1.15, 2.6, silver)  # antenna mast
+    model.disc(0, 0, 2.65, .55, silver)
+    model.box(-.16, .16, 1.1, 2.35, -.16, .16, silver)  # forward sensor boom
+    model.disc(0, 2.35, .17, .48, (.78, .84, .88, 1))
+    return model.item()
+
+
+def create_drone_mesh():
+    model = ColoredMesh()
+    shell = (.22, .34, .41, 1)
+    arm = (.52, .62, .68, 1)
+    rotor = (.08, .72, .83, .88)
+    model.box(-1.3, 1.3, -1.05, 1.05, -.55, .55, shell)
+    model.box(-.8, .8, .55, 1.15, .55, .68, (.96, .45, .20, 1))  # forward marker
+    for x in (-3.3, 3.3):
+        for y in (-3.0, 3.0):
+            x0, x1 = sorted((0, x))
+            y0, y1 = sorted((0, y))
+            model.box(x0, x1, y - .14, y + .14, -.12, .14, arm)
+            model.box(x - .14, x + .14, y0, y1, -.12, .14, arm)
+            model.box(x - .45, x + .45, y - .45, y + .45, .05, .4, shell)
+            model.disc(x, y, .48, 1.12, rotor)
+            model.disc(x, y, .5, .18, shell)
+    for x in (-.9, .9):
+        model.box(x - .08, x + .08, -1.4, 1.4, -1.55, -.5, arm)
+        model.box(x - .22, x + .22, -1.5, 1.5, -1.6, -1.48, arm)
+    return model.item()
 
 def create_aircraft_mesh():
     verts = [[0.0,5.0,0.0],[-1.0,-2.0,-0.5],[1.0,-2.0,-0.5],[0.0,-2.0,1.0],[-7.0,-2.0,0.0],[7.0,-2.0,0.0],[0.0,-5.0,3.0],[0.0,-5.0,0.0]]
@@ -177,7 +394,7 @@ class TelemetryDashboard(QMainWindow):
         self.estimator = AttitudeEstimator()
         self.events = MotionEvents()
         self.active_mesh = None
-        self.last_model_index = 1
+        self.last_model_index = 0
         self.data = {axis: deque(maxlen=self.max_points) for axis in ('ax', 'ay', 'az', 'gx', 'gy', 'gz')}
         self.plot_times = deque(maxlen=self.max_points)
         self.sample_timestamps = deque(maxlen=120)
@@ -185,7 +402,12 @@ class TelemetryDashboard(QMainWindow):
         self.latest_motion = None
         self.latest_net_g = self.peak_g = 0.0
         self.pitch = self.roll = self.yaw = 0.0
-        self.is_demo_mode = self.paused = False
+        self.is_demo_mode = self.is_replay_mode = self.paused = False
+        self.session_recorder = None
+        self.loaded_session = None
+        self.replay_position_s = 0.0
+        self.replay_seeking = False
+        self.replay_step_in_flight = False
         self.requested_interval = 0.03
         self.session_started = self.last_sample_at = None
         self.last_plot_render = self.last_stats_render = 0.0
@@ -203,7 +425,10 @@ class TelemetryDashboard(QMainWindow):
         self.shortcuts = []
         for key, button in self.button_map.items():
             shortcut = QShortcut(QKeySequence(key), self)
-            shortcut.activated.connect(button.click)
+            if key == 'p':
+                shortcut.activated.connect(self.toggle_pause_shortcut)
+            else:
+                shortcut.activated.connect(button.click)
             self.shortcuts.append(shortcut)
         escape = QShortcut(QKeySequence("Escape"), self)
         escape.activated.connect(self.focus_overlay.restore)
@@ -251,14 +476,32 @@ class TelemetryDashboard(QMainWindow):
         body = QSplitter(Qt.Orientation.Horizontal)
         body.setChildrenCollapsible(False)
         body.setHandleWidth(8)
+        self.rail_scroll = RailScrollArea()
+        rail_scroll = self.rail_scroll
+        rail_scroll.setObjectName("railScroll")
+        rail_scroll.setWidgetResizable(True)
+        rail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        rail_scroll.setMinimumWidth(210)
+        rail_scroll.setMaximumWidth(300)
         rail = QFrame()
         rail.setObjectName("rail")
-        rail.setMinimumWidth(210)
-        rail.setMaximumWidth(300)
+        rail_scroll.setWidget(rail)
         controls = QVBoxLayout(rail)
-        controls.setContentsMargins(14, 16, 14, 14)
-        controls.setSpacing(10)
-        controls.addWidget(self.label("STREAM CONTROL", "section"))
+        controls.setContentsMargins(10, 10, 9, 10)
+        controls.setSpacing(4)
+        self.rail_sections = {}
+
+        def section_layout(title, expanded=False):
+            content = QWidget()
+            content_layout = QVBoxLayout(content)
+            content_layout.setContentsMargins(2, 1, 2, 4)
+            content_layout.setSpacing(5)
+            pane = CollapsibleSection(title, content, expanded)
+            self.rail_sections[title] = pane
+            controls.addWidget(pane)
+            return content_layout
+
+        stream_controls = section_layout("STREAM CONTROL", True)
         rates = QGridLayout()
         self.rate_buttons = {}
         definitions = [
@@ -277,40 +520,100 @@ class TelemetryDashboard(QMainWindow):
             self.button_map[key] = button
         self.btn_vis, self.btn_fast, self.btn_norm, self.btn_slow = [self.rate_buttons[k] for k in 'vfns']
         self.btn_vis.setChecked(True)
-        controls.addLayout(rates)
+        stream_controls.addLayout(rates)
         self.btn_pause = QPushButton("Pause telemetry  [P]")
         self.btn_pause.clicked.connect(lambda: self.send_command('p'))
         self.button_map['p'] = self.btn_pause
-        controls.addWidget(self.btn_pause)
-        controls.addSpacing(12)
-        controls.addWidget(self.label("3D ATTITUDE", "section"))
+        stream_controls.addWidget(self.btn_pause)
+        session_controls = section_layout("SESSION CAPTURE + REPLAY", True)
+        self.btn_record = QPushButton("Start recording")
+        self.btn_record.setObjectName("primary")
+        self.btn_record.setToolTip("Record validated live or demo telemetry to a CSV/JSON session pair.")
+        self.btn_record.clicked.connect(self.toggle_recording)
+        session_controls.addWidget(self.btn_record)
+        self.btn_open_session = QPushButton("Open session for replay…")
+        self.btn_open_session.setToolTip("Load a saved CSV or JSON session without connecting hardware.")
+        self.btn_open_session.clicked.connect(self.open_session)
+        session_controls.addWidget(self.btn_open_session)
+        playback_row = QHBoxLayout()
+        playback_row.setSpacing(5)
+        self.btn_play_replay = QPushButton("Play  ▶")
+        self.btn_play_replay.setObjectName("primary")
+        self.btn_play_replay.setEnabled(False)
+        self.btn_play_replay.setToolTip("Play or pause this recording (P).")
+        self.btn_play_replay.clicked.connect(self.toggle_replay_playback)
+        playback_row.addWidget(self.btn_play_replay, 1)
+        self.btn_restart_replay = QPushButton("Restart  ↺")
+        self.btn_restart_replay.setEnabled(False)
+        self.btn_restart_replay.clicked.connect(self.restart_replay)
+        playback_row.addWidget(self.btn_restart_replay)
+        session_controls.addLayout(playback_row)
+        self.lbl_replay_time = self.label("No replay loaded", "muted")
+        self.lbl_replay_time.setWordWrap(True)
+        session_controls.addWidget(self.lbl_replay_time)
+        self.replay_slider = QSlider(Qt.Orientation.Horizontal)
+        self.replay_slider.setRange(0, 1000)
+        self.replay_slider.setEnabled(False)
+        self.replay_slider.setToolTip("Drag and release to seek. Replay processing is rebuilt through the selected point.")
+        self.replay_slider.sliderPressed.connect(self.begin_replay_seek)
+        self.replay_slider.sliderMoved.connect(self.preview_replay_seek)
+        self.replay_slider.sliderReleased.connect(self.commit_replay_seek)
+        session_controls.addWidget(self.replay_slider)
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(self.label("PLAYBACK SPEED", "muted"))
+        speed_row.addStretch()
+        self.lbl_replay_speed = self.label("1×", "healthValue")
+        speed_row.addWidget(self.lbl_replay_speed)
+        session_controls.addLayout(speed_row)
+        self.replay_speeds = (.25, .5, 1., 2., 4.)
+        self.replay_speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.replay_speed_slider.setRange(0, len(self.replay_speeds) - 1)
+        self.replay_speed_slider.setValue(2)
+        self.replay_speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.replay_speed_slider.setTickInterval(1)
+        self.replay_speed_slider.setPageStep(1)
+        self.replay_speed_slider.setEnabled(False)
+        self.replay_speed_slider.setToolTip("Snap between 0.25×, 0.5×, 1×, 2×, and 4× playback.")
+        self.replay_speed_slider.valueChanged.connect(self.set_replay_speed)
+        session_controls.addWidget(self.replay_speed_slider)
+        speed_labels = QHBoxLayout()
+        speed_labels.addWidget(self.label("0.25×", "muted"))
+        speed_labels.addStretch()
+        speed_labels.addWidget(self.label("1×", "muted"))
+        speed_labels.addStretch()
+        speed_labels.addWidget(self.label("4×", "muted"))
+        session_controls.addLayout(speed_labels)
+        self.btn_step = QPushButton("Step one frame  ▸|")
+        self.btn_step.setEnabled(False)
+        self.btn_step.setToolTip("Pause replay and advance one recorded sample.")
+        self.btn_step.clicked.connect(self.step_replay)
+        session_controls.addWidget(self.btn_step)
+        attitude_controls = section_layout("3D ATTITUDE")
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["Satellite / Spacecraft", "Jet Aircraft", "CubeSat Enclosure", "Load Custom STL…"])
-        self.model_combo.setCurrentIndex(1)
+        self.model_combo.addItems(["Jet Aircraft", "Orbital Satellite", "Quadcopter Drone", "Load Custom STL…"])
+        self.model_combo.setCurrentIndex(0)
         self.model_combo.currentIndexChanged.connect(self.change_3d_model)
-        controls.addWidget(self.model_combo)
+        attitude_controls.addWidget(self.model_combo)
         self.btn_reset_yaw = QPushButton("Reset attitude  [R]")
         self.btn_reset_yaw.clicked.connect(self.reset_yaw)
         self.button_map['r'] = self.btn_reset_yaw
-        controls.addWidget(self.btn_reset_yaw)
-        controls.addSpacing(12)
-        controls.addWidget(self.label("MEMORY TOOLS", "section"))
+        attitude_controls.addWidget(self.btn_reset_yaw)
+        memory_controls = section_layout("MEMORY TOOLS")
         self.btn_dump = QPushButton("Export memory snapshot  [D]")
         self.btn_dump.clicked.connect(lambda: self.send_command('d'))
         self.btn_clear = QPushButton("Erase flash sector 5  [C]")
         self.btn_clear.setObjectName("danger")
         self.btn_clear.clicked.connect(lambda: self.send_command('c'))
         self.button_map.update({'d': self.btn_dump, 'c': self.btn_clear})
-        controls.addWidget(self.btn_dump)
-        controls.addWidget(self.btn_clear)
-        controls.addSpacing(12)
-        controls.addWidget(self.label("FIRMWARE TERMINAL", "section"))
+        memory_controls.addWidget(self.btn_dump)
+        memory_controls.addWidget(self.btn_clear)
+        terminal_controls = section_layout("FIRMWARE TERMINAL")
         terminal_rate_row = QHBoxLayout()
         terminal_rate_row.addWidget(self.label("OUTPUT RATE", "muted"))
         self.lbl_terminal_rate = self.label("1000 ms", "healthValue")
         terminal_rate_row.addStretch()
         terminal_rate_row.addWidget(self.lbl_terminal_rate)
-        controls.addLayout(terminal_rate_row)
+        terminal_controls.addLayout(terminal_rate_row)
         self.terminal_rate_slider = QSlider(Qt.Orientation.Horizontal)
         self.terminal_rate_slider.setRange(0, len(self.terminal_rate_options) - 1)
         self.terminal_rate_slider.setValue(0)
@@ -318,14 +621,14 @@ class TelemetryDashboard(QMainWindow):
         self.terminal_rate_slider.setTickInterval(1)
         self.terminal_rate_slider.setToolTip("Choose how often TEL summaries are printed. Sensor capture remains full rate.")
         self.terminal_rate_slider.valueChanged.connect(self.set_terminal_rate)
-        controls.addWidget(self.terminal_rate_slider)
+        terminal_controls.addWidget(self.terminal_rate_slider)
         self.btn_timestamps = QPushButton("Show timestamps")
         self.btn_timestamps.setObjectName("terminalFilter")
         self.btn_timestamps.setCheckable(True)
         self.btn_timestamps.setChecked(True)
         self.btn_timestamps.setToolTip("Show the local receive time before each terminal prefix.")
         self.btn_timestamps.toggled.connect(lambda checked: self.render_terminal(force=True))
-        controls.addWidget(self.btn_timestamps)
+        terminal_controls.addWidget(self.btn_timestamps)
         terminal_filters = [
             ('SYS', 'SYS · System & commands', 'Connection state and commands sent to the device.'),
             ('TEL', 'TEL · Sensor frames', 'Periodic sensor frames and firmware telemetry.'),
@@ -340,9 +643,10 @@ class TelemetryDashboard(QMainWindow):
             button.setToolTip(tooltip)
             button.toggled.connect(lambda checked, kind=category: self.set_terminal_filter(kind, checked))
             self.terminal_filter_buttons[category] = button
-            controls.addWidget(button)
+            terminal_controls.addWidget(button)
         controls.addStretch()
-        body.addWidget(rail)
+        rail_scroll.enable_wheel_navigation()
+        body.addWidget(rail_scroll)
 
         workspace = QWidget()
         work = QVBoxLayout(workspace)
@@ -515,8 +819,9 @@ class TelemetryDashboard(QMainWindow):
         body.setSizes([245, 1170])
         layout.addWidget(body, 1)
         self.focus_overlay = FocusOverlay(root)
-        self.change_3d_model(1)
+        self.change_3d_model(0)
         self.set_stream_controls(False)
+        self.set_session_controls()
         self.log_message("SYS >> READY · SELECT A SERIAL PORT OR DEMO, THEN CONNECT")
 
     def make_graph(self, label, units, yrange):
@@ -557,11 +862,26 @@ class TelemetryDashboard(QMainWindow):
 
     def set_stream_controls(self, enabled):
         for key in 'vfnspdc':
-            self.button_map[key].setEnabled(enabled)
+            self.button_map[key].setEnabled(enabled and not self.is_replay_mode)
         self.port_combo.setEnabled(not enabled)
 
+    def set_session_controls(self):
+        active = self.worker is not None
+        live_source = active and not self.is_replay_mode
+        recording = self.session_recorder is not None
+        self.btn_record.setEnabled(live_source)
+        self.btn_record.setText("Stop & save recording" if recording else "Start recording")
+        self.btn_open_session.setEnabled(not active)
+        self.btn_restart_replay.setEnabled(self.loaded_session is not None and (not active or self.is_replay_mode))
+        replay_active = active and self.is_replay_mode
+        self.btn_play_replay.setEnabled(replay_active)
+        self.btn_play_replay.setText("Play  ▶" if self.paused or not replay_active else "Pause  ❚❚")
+        self.replay_slider.setEnabled(replay_active)
+        self.replay_speed_slider.setEnabled(replay_active)
+        self.btn_step.setEnabled(replay_active)
+
     def change_3d_model(self, index):
-        factories = [create_satellite_mesh, create_aircraft_mesh, create_cubesat_mesh]
+        factories = [create_aircraft_mesh, create_satellite_mesh, create_drone_mesh]
         if index < 3:
             new_mesh = factories[index]()
         else:
@@ -606,19 +926,16 @@ class TelemetryDashboard(QMainWindow):
         self.port_combo.addItem("DEMO — No Hardware")
         self.port_combo.addItems([port.device for port in serial.tools.list_ports.comports()])
 
-    def toggle_connection(self):
-        if self.worker is not None:
-            self.disconnect_source()
-            return
-        port = self.port_combo.currentText()
-        self.is_demo_mode = port.startswith("DEMO")
+    def reset_visual_session(self):
+        """Reset derived dashboard state before switching data sources or seeking."""
         self.paused = False
-        self.requested_interval = 0.03
         self.events = MotionEvents()
         self.recent_events.clear()
+        self.latest_motion = None
         self.latest_net_g = self.peak_g = 0.0
         self.sample_timestamps.clear()
         self.plot_times.clear()
+        self.frame_timestamps.clear()
         self.last_terminal_telemetry_at = 0.0
         for values in self.data.values():
             values.clear()
@@ -630,6 +947,17 @@ class TelemetryDashboard(QMainWindow):
         self.lbl_recent.setText("No events recorded")
         self.lbl_event_axis.setText("—")
         self.lbl_event_peak.setText("—")
+        self.replay_position_s = 0.0
+
+    def toggle_connection(self):
+        if self.worker is not None:
+            self.disconnect_source()
+            return
+        port = self.port_combo.currentText()
+        self.is_demo_mode = port.startswith("DEMO")
+        self.is_replay_mode = False
+        self.requested_interval = 0.03
+        self.reset_visual_session()
         self.btn_pause.setText("Pause telemetry  [P]")
         for key, button in self.rate_buttons.items():
             button.setChecked(key == 'v')
@@ -639,12 +967,204 @@ class TelemetryDashboard(QMainWindow):
         worker.log_received.connect(self.log_message)
         worker.finished.connect(lambda source=worker: self.source_finished(source))
         self.set_stream_controls(True)
+        self.set_session_controls()
         self.btn_connect.setText("Disconnect")
         self.lbl_status.setText("CONNECTING")
         worker.start()
         QTimer.singleShot(500, lambda source=worker: self.send_command(
             next(key for key, button in self.rate_buttons.items() if button.isChecked()))
             if self.worker is source and not self.paused else None)
+
+    def toggle_recording(self):
+        if self.session_recorder is not None:
+            self.stop_recording()
+            return
+        if self.worker is None or self.is_replay_mode:
+            return
+        default_name = "telemetry_session.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save telemetry session", default_name, "Telemetry session (*.csv)"
+        )
+        if not path:
+            return
+        self.start_recording_at_path(path)
+
+    def start_recording_at_path(self, path):
+        """Start recording at a supplied path; shared by the dialog and desktop smoke test."""
+        if self.session_recorder is not None or self.worker is None or self.is_replay_mode:
+            return False
+        try:
+            self.session_recorder = SessionRecorder(path, {
+                "application_version": "telemetry-console-prototype",
+                "source": "demo" if self.is_demo_mode else "serial",
+                "serial_port": None if self.is_demo_mode else self.port_combo.currentText(),
+                "requested_interval_ms": int(self.requested_interval * 1000),
+                "firmware_version": "unknown",
+                "calibration_id": "not-calibrated",
+                "processing_baseline": "attitude and motion-event state reset at recording start",
+                "recording_policy": "validated samples; derived attitude and events included",
+            })
+        except OSError as error:
+            QMessageBox.warning(self, "Recording Failed", str(error))
+            return False
+        # A recording is a self-contained replay session.  Starting it from a
+        # known estimator/event state means reconstructed playback produces the
+        # same state evolution rather than inheriting an unseen live history.
+        self.reset_visual_session()
+        self.log_message(f"SYS >> RECORDING STARTED · {self.session_recorder.csv_path.name}")
+        self.set_session_controls()
+        return True
+
+    def stop_recording(self):
+        recorder, self.session_recorder = self.session_recorder, None
+        if recorder is None:
+            return
+        try:
+            manifest = recorder.close({"source_end_reason": "user stopped recording"})
+            self.log_message(f"SYS >> RECORDING SAVED · {recorder.sample_count} SAMPLES · {manifest.name}")
+        except OSError as error:
+            self.log_message(f"WARN >> RECORDING FINALIZE FAILED · {error}")
+        self.set_session_controls()
+
+    def open_session(self):
+        if self.worker is not None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open telemetry session", "", "Telemetry session (*.csv *.json)"
+        )
+        if not path:
+            return
+        try:
+            self.loaded_session = load_session(path)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Session Load Failed", str(error))
+            return
+        self.start_replay(self.loaded_session)
+
+    def restart_replay(self):
+        if isinstance(self.worker, ReplayWorker):
+            self.worker.set_paused(True)
+            self.paused = True
+            self.rebuild_replay_to(0)
+            self.worker.set_next_index(1)
+            self.update_replay_progress(0.0, self.loaded_session.duration_s, force=True)
+            self.worker.set_paused(False)
+            self.paused = False
+            self.set_session_controls()
+        elif self.worker is None and self.loaded_session is not None:
+            self.start_replay(self.loaded_session)
+
+    def start_replay(self, session: Session):
+        if self.worker is not None:
+            return
+        self.loaded_session = session
+        self.is_demo_mode = False
+        self.is_replay_mode = True
+        self.requested_interval = max(.001, session.samples[0].received_dt_s)
+        self.reset_visual_session()
+        self.btn_pause.setText("Pause telemetry  [P]")
+        self.replay_slider.setValue(0)
+        self.lbl_replay_time.setText(f"Replay 0.00 / {session.duration_s:.2f} s · {len(session.samples)} samples")
+        worker = ReplayWorker(session)
+        self.worker = worker
+        worker.data_received.connect(self.ingest_telemetry)
+        worker.log_received.connect(self.log_message)
+        worker.progress_received.connect(self.update_replay_progress)
+        worker.step_started.connect(self.begin_replay_step)
+        worker.step_completed.connect(self.end_replay_step)
+        worker.finished.connect(lambda source=worker: self.source_finished(source))
+        self.set_stream_controls(True)
+        self.set_session_controls()
+        self.btn_connect.setText("Stop replay")
+        self.lbl_status.setText("REPLAY")
+        worker.set_speed(self.replay_speeds[self.replay_speed_slider.value()])
+        worker.start()
+
+    def set_replay_speed(self, index):
+        speed = self.replay_speeds[index]
+        self.lbl_replay_speed.setText(f"{speed:g}×")
+        if isinstance(self.worker, ReplayWorker):
+            self.worker.set_speed(speed)
+            self.update_replay_progress(self.replay_position_s, self.loaded_session.duration_s, force=True)
+
+    def toggle_replay_playback(self):
+        if not isinstance(self.worker, ReplayWorker):
+            return
+        if self.paused:
+            # A worker may have queued a frame just before Pause was clicked.
+            # Continue after the last frame actually shown in the dashboard.
+            timestamps = [sample.timestamp_s for sample in self.loaded_session.samples]
+            self.worker.set_next_index(bisect_right(timestamps, self.replay_position_s))
+            self.paused = False
+        else:
+            self.paused = True
+        self.worker.set_paused(self.paused)
+        self.btn_play_replay.setText("Play  ▶" if self.paused else "Pause  ❚❚")
+        self.log_message(f"SYS >> REPLAY {'PAUSED' if self.paused else 'PLAYING'}")
+
+    def toggle_pause_shortcut(self):
+        if self.is_replay_mode:
+            self.btn_play_replay.click()
+        else:
+            self.btn_pause.click()
+
+    def step_replay(self):
+        if isinstance(self.worker, ReplayWorker):
+            self.worker.request_step()
+            self.paused = True
+            self.btn_play_replay.setText("Play  ▶")
+
+    def begin_replay_step(self):
+        self.replay_step_in_flight = True
+
+    def end_replay_step(self):
+        self.replay_step_in_flight = False
+
+    def begin_replay_seek(self):
+        self.replay_seeking = True
+
+    def preview_replay_seek(self, value):
+        if self.loaded_session is not None:
+            target = self.loaded_session.duration_s * value / self.replay_slider.maximum()
+            self.lbl_replay_time.setText(f"Seek to {target:.2f} / {self.loaded_session.duration_s:.2f} s")
+
+    def commit_replay_seek(self):
+        self.replay_seeking = False
+        if not isinstance(self.worker, ReplayWorker) or self.loaded_session is None:
+            return
+        target = self.loaded_session.duration_s * self.replay_slider.value() / self.replay_slider.maximum()
+        timestamps = [sample.timestamp_s for sample in self.loaded_session.samples]
+        index = min(bisect_left(timestamps, target), len(timestamps) - 1)
+        # The attitude filter and event detector are stateful.  Replaying the
+        # prior samples locally gives a seek the same result as a linear run.
+        self.rebuild_replay_to(index)
+        self.worker.set_next_index(index + 1)
+        self.update_replay_progress(timestamps[index], self.loaded_session.duration_s, force=True)
+        self.log_message(f"SYS >> REPLAY SEEK · {timestamps[index]:.2f} S")
+
+    def rebuild_replay_to(self, index):
+        if self.loaded_session is None:
+            return
+        was_paused = self.paused
+        self.reset_visual_session()
+        for sample in self.loaded_session.samples[:index + 1]:
+            self.ingest_telemetry(
+                sample.ax_g, sample.ay_g, sample.az_g, sample.gx_dps, sample.gy_dps, sample.gz_dps,
+                sample.received_dt_s, source_time_s=sample.timestamp_s, record=False, report=False,
+                allow_paused=True,
+            )
+        self.paused = was_paused
+        self.render_frame(force=True)
+
+    def update_replay_progress(self, position_s, duration_s, force=False):
+        if self.paused and not (force or self.replay_step_in_flight):
+            return
+        self.replay_position_s = position_s
+        if not self.replay_seeking and duration_s:
+            self.replay_slider.setValue(round(position_s / duration_s * self.replay_slider.maximum()))
+        self.lbl_replay_time.setText(
+            f"Replay {position_s:.2f} / {duration_s:.2f} s · {self.replay_speeds[self.replay_speed_slider.value()]:g}×"
+        )
 
     def disconnect_source(self):
         worker = self.worker
@@ -660,15 +1180,31 @@ class TelemetryDashboard(QMainWindow):
     def source_finished(self, source):
         if self.worker is not source:
             return
+        was_replay = self.is_replay_mode
+        replay_completed = was_replay and source.next_index >= len(source.session.samples)
         self.worker = None
         source.deleteLater()
         self.paused = False
+        self.is_replay_mode = False
+        self.is_demo_mode = False
+        if self.session_recorder is not None:
+            self.stop_recording()
         self.set_stream_controls(False)
+        self.set_session_controls()
         self.btn_connect.setText("Connect")
         self.btn_pause.setText("Pause telemetry  [P]")
+        if was_replay and self.loaded_session is not None:
+            self.lbl_replay_time.setText(
+                (f"Replay complete · {self.loaded_session.duration_s:.2f} s · "
+                 f"{len(self.loaded_session.samples)} samples") if replay_completed else
+                f"Replay stopped at {self.replay_position_s:.2f} / {self.loaded_session.duration_s:.2f} s"
+            )
         self.update_stats(time.monotonic())
 
     def send_command(self, cmd):
+        if self.is_replay_mode and cmd == 'p':
+            self.toggle_replay_playback()
+            return
         if self.worker is None or not self.worker.isRunning():
             return
         try:
@@ -684,32 +1220,51 @@ class TelemetryDashboard(QMainWindow):
                 button.setChecked(key == cmd)
         elif cmd == 'p':
             self.paused = not self.paused
-            self.btn_pause.setText(("Resume" if self.paused else "Pause") + " telemetry  [P]")
+            subject = "replay" if self.is_replay_mode else "telemetry"
+            self.btn_pause.setText(("Resume" if self.paused else "Pause") + f" {subject}  [P]")
             if not self.paused:
                 self.last_sample_at = time.monotonic()
                 self.sample_timestamps.clear()
         self.log_message(f"SYS >> COMMAND SENT · {cmd.upper()}")
 
-    def ingest_telemetry(self, ax, ay, az, gx, gy, gz, dt):
-        if self.worker is None or self.paused:
+    def ingest_telemetry(self, ax, ay, az, gx, gy, gz, dt, source_time_s=None, record=True,
+                         report=True, allow_paused=False):
+        if self.worker is None or (self.paused and not allow_paused and not self.replay_step_in_flight):
             return
         now = time.monotonic()
+        if source_time_s is None:
+            source_time_s = self.replay_position_s if self.is_replay_mode else now - self.session_started
         for key, value in zip(('ax', 'ay', 'az', 'gx', 'gy', 'gz'), (ax, ay, az, gx, gy, gz)):
             self.data[key].append(value)
-        self.plot_times.append(now - self.session_started)
+        self.plot_times.append(source_time_s)
         sample = TelemetrySample(ax, ay, az, gx, gy, gz)
         self.latest_motion = self.estimator.update(sample, dt)
         self.pitch, self.roll, self.yaw = self.latest_motion.pitch, self.latest_motion.roll, self.latest_motion.yaw
-        event = self.events.update(sample, now)
+        event = self.events.update(sample, source_time_s)
         if event is not None:
             stamp = time.strftime("%H:%M:%S")
             self.recent_events.appendleft(f"{stamp}   {event.kind}")
-            self.log_message(f"EVT >> {event.kind} · {event.peak_g:.2f} G MEASURED PEAK")
+            if report:
+                self.log_message(f"EVT >> {event.kind} · {event.peak_g:.2f} G MEASURED PEAK")
         self.latest_net_g = self.events.magnitude
         self.peak_g = max(self.peak_g, self.latest_net_g)
         self.sample_timestamps.append(now)
         self.last_sample_at = now
-        if now - self.last_terminal_telemetry_at >= self.terminal_rate_interval:
+        if self.session_recorder is not None and record:
+            try:
+                self.session_recorder.write(SessionSample(
+                    source_time_s, dt, ax, ay, az, gx, gy, gz,
+                    self.latest_motion.pitch, self.latest_motion.roll, self.latest_motion.yaw,
+                    self.latest_motion.linear_ax, self.latest_motion.linear_ay, self.latest_motion.linear_az,
+                    self.events.state,
+                    event.kind if event is not None else "",
+                    event.peak_g if event is not None else None,
+                    event.axis if event is not None else "",
+                ))
+            except OSError as error:
+                self.log_message(f"WARN >> RECORDING WRITE FAILED · {error}")
+                self.stop_recording()
+        if report and now - self.last_terminal_telemetry_at >= self.terminal_rate_interval:
             self.log_message(
                 f"TEL >> AX:{ax:+.2f} AY:{ay:+.2f} AZ:{az:+.2f} · "
                 f"GX:{gx:+.1f} GY:{gy:+.1f} GZ:{gz:+.1f}"
@@ -759,10 +1314,14 @@ class TelemetryDashboard(QMainWindow):
         elif not fresh:
             status, color = "NO RECENT DATA", '#ebc66d'
         else:
-            status, color = ("DEMO CONNECTED" if self.is_demo_mode else "CONNECTED"), '#79d7a6'
+            status, color = ("REPLAYING" if self.is_replay_mode else
+                             ("DEMO CONNECTED" if self.is_demo_mode else "CONNECTED")), '#79d7a6'
         self.lbl_status.setText(status)
         self.lbl_status.setStyleSheet(f"color: {color}; font-weight: 600;")
-        self.lbl_connection.setText(("Simulation" if self.is_demo_mode else "Serial") if running else "Offline")
+        self.lbl_connection.setText(
+            ("Replay" if self.is_replay_mode else ("Simulation" if self.is_demo_mode else "Serial"))
+            if running else "Offline"
+        )
         stamps = list(self.sample_timestamps)
         hz = ((len(stamps) - 1) / (stamps[-1] - stamps[0])) if len(stamps) > 1 and stamps[-1] > stamps[0] else 0
         if not running or self.paused or not fresh:
@@ -785,8 +1344,9 @@ class TelemetryDashboard(QMainWindow):
             else "Motion labels use measured sensor activity"
         )
 
-        self.lbl_health_source.setText("DEMO" if self.is_demo_mode and running else
-                                       (self.port_combo.currentText() if running else "—"))
+        self.lbl_health_source.setText("REPLAY" if self.is_replay_mode and running else
+                                       ("DEMO" if self.is_demo_mode and running else
+                                        (self.port_combo.currentText() if running else "—")))
         age = now - self.last_sample_at if self.last_sample_at is not None else None
         self.lbl_health_last_frame.setText(f"{age * 1000:.0f} MS" if age is not None and running else "—")
         self.lbl_health_invalid.setText(str(getattr(self.worker, 'invalid_frames', 0)) if running else "0")
