@@ -113,6 +113,8 @@ volatile uint32_t command_rx_count = 0;
 volatile uint32_t command_rx_drop_count = 0;
 static uint32_t telemetry_sequence = 0;
 static const char *boot_reset_reason = "UNKNOWN";
+static volatile uint8_t fault_corrupt_next_frame = 0;
+static volatile uint8_t fault_starve_watchdog = 0;
 
 // Crash Detection Flag
 volatile uint8_t crash_logged = 0;
@@ -649,6 +651,13 @@ void StartDefaultTask(void *argument)
   /* Infinite loop */
 	for(;;)
 	  {
+	    // A one-shot demo command deliberately stops this task and its IWDG
+	    // refresh. Hardware resets the MCU; boot clears the flag automatically.
+	    if (fault_starve_watchdog)
+	    {
+	        osDelay(20);
+	        continue;
+	    }
 	    HAL_IWDG_Refresh(&hiwdg);
 
 	    if (!telemetry_paused)
@@ -685,6 +694,21 @@ void StartDefaultTask(void *argument)
 	                    "|CHK:0x%02X\r\n", chk);
 	                if (suffix_len > 0 && suffix_len < (int)(sizeof(uart_buf) - data_len))
 	                {
+	                    if (fault_corrupt_next_frame)
+	                    {
+	                        // Flip exactly one bit in a numeric AX character
+	                        // AFTER computing CHK. The packet remains parseable
+	                        // but must fail the host's checksum validation.
+	                        for (int i = 3; i < data_len; i++)
+	                        {
+	                            if (uart_buf[i] >= '0' && uart_buf[i] <= '9')
+	                            {
+	                                uart_buf[i] ^= 1;
+	                                break;
+	                            }
+	                        }
+	                        fault_corrupt_next_frame = 0;
+	                    }
 	                    HAL_UART_Transmit_DMA(&huart2, (uint8_t *)uart_buf, data_len + suffix_len);
 	                    telemetry_sequence++;
 	                }
@@ -721,6 +745,7 @@ void StartStatusTask(void *argument)
   /* USER CODE BEGIN StartStatusTask */
   static char status_buf[224];
   uint8_t received_cmd = 0;
+  uint32_t next_heartbeat = osKernelGetTickCount();
 
   /* Infinite loop */
   for(;;)
@@ -865,12 +890,50 @@ void StartStatusTask(void *argument)
                     osMutexRelease(uartMutexHandle);
                 }
             }
+            else if (received_cmd == 'x' || received_cmd == 'w')
+            {
+                if (uartMutexHandle != NULL && osMutexAcquire(uartMutexHandle, 100) == osOK)
+                {
+                    while (huart2.gState != HAL_UART_STATE_READY) { osDelay(1); }
+                    int len = snprintf(status_buf, sizeof(status_buf), "[FAULT]: %s\r\n",
+                                       received_cmd == 'x' ? "CHECKSUM ARMED" : "WATCHDOG STARVE");
+                    if (len > 0 && len < (int)sizeof(status_buf) &&
+                        HAL_UART_Transmit_DMA(&huart2, (uint8_t *)status_buf, len) == HAL_OK)
+                    {
+                        if (received_cmd == 'x') fault_corrupt_next_frame = 1;
+                        else fault_starve_watchdog = 1;
+                    }
+                    osMutexRelease(uartMutexHandle);
+                }
+            }
+            else if (received_cmd == 'm')
+            {
+                if (uartMutexHandle != NULL && osMutexAcquire(uartMutexHandle, 100) == osOK)
+                {
+                    while (huart2.gState != HAL_UART_STATE_READY) { osDelay(1); }
+                    int len = snprintf(status_buf, sizeof(status_buf), "[FAULT]: MUTEX HOLD\r\n");
+                    if (len > 0 && len < (int)sizeof(status_buf))
+                        HAL_UART_Transmit_DMA(&huart2, (uint8_t *)status_buf, len);
+                    while (huart2.gState != HAL_UART_STATE_READY) { osDelay(1); }
+                    osDelay(350); // Bounded contention; IWDG remains fed by TelemetryTask.
+                    osMutexRelease(uartMutexHandle);
+                    if (osMutexAcquire(uartMutexHandle, 100) == osOK)
+                    {
+                        while (huart2.gState != HAL_UART_STATE_READY) { osDelay(1); }
+                        len = snprintf(status_buf, sizeof(status_buf), "[FAULT]: MUTEX RELEASED\r\n");
+                        if (len > 0 && len < (int)sizeof(status_buf))
+                            HAL_UART_Transmit_DMA(&huart2, (uint8_t *)status_buf, len);
+                        osMutexRelease(uartMutexHandle);
+                    }
+                }
+            }
         }
     }
 
     // Print a periodic system health heartbeat every 5 seconds.
     // RX should increment when the PC sends a rate command.
-    if (uartMutexHandle != NULL && osMutexAcquire(uartMutexHandle, 100) == osOK)
+    if ((int32_t)(osKernelGetTickCount() - next_heartbeat) >= 0 &&
+        uartMutexHandle != NULL && osMutexAcquire(uartMutexHandle, 100) == osOK)
     {
         while (huart2.gState != HAL_UART_STATE_READY) { osDelay(1); }
 
@@ -886,9 +949,10 @@ void StartStatusTask(void *argument)
             HAL_UART_Transmit_DMA(&huart2, (uint8_t *)status_buf, len);
 
         osMutexRelease(uartMutexHandle);
+        next_heartbeat = osKernelGetTickCount() + 5000;
     }
 
-    osDelay(5000); // Yield CPU execution to TelemetryTask for 5 seconds
+    osDelay(20); // Check queued commands promptly; heartbeat stays on its 5 s cadence.
   }
   /* USER CODE END StartStatusTask */
 }

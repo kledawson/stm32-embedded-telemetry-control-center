@@ -16,6 +16,7 @@ Open `MPU6050_FreeRTOS.ioc` or `.project` in STM32CubeIDE and build the project 
 - UART receive/drop counters, boot reset reason, device ID, and both task stack high-water marks in the heartbeat
 - Deadline-based telemetry scheduling with `osDelayUntil`
 - Flash-backed crash-log support
+- One-shot fault demo commands: `x` flips one outgoing telemetry payload bit after CHK calculation, `m` holds the UART mutex for 350 ms, and `w` stops IWDG refresh so hardware resets the MCU. The host waits for `[FAULT]:` markers and actual telemetry or boot evidence before claiming success.
 
 ## Provenance
 

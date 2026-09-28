@@ -4,9 +4,10 @@ A desktop view for an STM32F401RE and MPU6050 motion sensor. The STM32 reads the
 
 ## What it does
 
-- Shows live acceleration, rotation, motion events, and a 3D aircraft. Demo mode works without hardware.
+- Shows the latest 30 seconds of acceleration and rotation, motion events, and a 3D aircraft. Demo mode works without hardware.
 - Records sessions to CSV with a JSON manifest, then replays them with seek, step, and speed controls.
 - Guides gyro and six-face accelerometer calibration. Profiles are saved on the PC for each board.
+- Demonstrates a one-bit checksum failure, UART mutex contention, and a watchdog reset on the real board or through a hardware-free simulation.
 - Shows connection health: checksum errors, packet loss, timing, throughput, reset cause, and FreeRTOS stack margin.
 - Runs STM32 firmware with FreeRTOS tasks, DMA UART output, a watchdog, and a Flash crash snapshot.
 
@@ -31,6 +32,10 @@ Choose **DEMO — No Hardware** and **Connect** to explore the dashboard. For li
 
 **Check health:** Open **Calibrate** to see checksum errors, packet loss, jitter, and throughput. Expand **Technical details** for reset cause, task stack margin, command drops, and the board ID. Older firmware can still stream data but may not provide every health field.
 
+**Demonstrate failures:** With the updated firmware flashed, connect the board and open **Fault Injection** beside Calibrate. **Bit flip + checksum** changes one outgoing sensor frame on the board after its checksum was calculated. An animated packet flow shows the original value and checksum, the bit changed on UART, the host's rejection, and the next accepted frame. **UART mutex contention** briefly holds the shared UART lock. Its millisecond timeline draws live COM3 arrivals and the growing hold once, then freezes the captured result. Large readouts show the measured packet gap and mutex hold duration. **Watchdog reset** shows the telemetry task, hardware watchdog, and MCU transition, plus a packet-arrival timeline retained across COM reconnection. After recovery, the timeline compresses the real silence interval with an explicit axis break so validated packets on either side are visible at millisecond scale. The app confirms `Reset: IWDG` and fresh telemetry before reporting recovery. Display pacing never delays COM3 telemetry. Each test is one shot. If the expected firmware response does not arrive, the window reports the test as unconfirmed. The watchdog test closes an active recording before the reset. The window opens as large as useful without exceeding the current monitor's available space.
+
+For a hardware-free walkthrough, connect **DEMO — No Hardware** and open the same Fault Injection window. Its three tests use the same packet, mutex timeline, and watchdog visuals as COM3. Demo packets pass through the parser; the one-bit change fails checksum validation, the mutex briefly interrupts packets, and the watchdog stops and restarts the simulated stream. Each run uses slightly varied sensor values and timing, and the window labels all simulated evidence as Demo.
+
 The live shortcuts are **V/F/N/S** for stream rates, **P** for pause, **R** to zero the orientation estimate, and **D** to dump the Flash snapshot. **C** erases and re-arms the crash log in Flash Sector 5. **Escape** closes an expanded plot or 3D view.
 
 ## Test and navigate the code
@@ -40,13 +45,14 @@ python -m unittest discover -s tests -v
 python tests/smoke_dashboard.py
 ```
 
-The first command runs hardware-free unit tests. The second opens the desktop app and needs its UI dependencies and OpenGL context. With a board connected and its port free, `python tests/live_serial_smoke.py COM3 --seconds 7 --gyro-check` checks the serial stream; `python tests/live_dashboard_smoke.py COM3` checks the live UI. Replace `COM3` with your port.
+The first command runs hardware-free unit tests. The second opens the desktop app and needs its UI dependencies and OpenGL context. With a board connected and its port free, `python tests/live_serial_smoke.py COM3 --seconds 7 --gyro-check` checks the serial stream; `python tests/live_dashboard_smoke.py COM3` checks the live UI. `python tests/live_fault_smoke.py COM3` verifies the three firmware faults and intentionally resets the board once. `python tests/live_fault_dashboard_smoke.py COM3` exercises them through the desktop window. Replace `COM3` with your port.
 
 - `app.py`: main window and controls
 - `sources.py`: serial, demo, and replay workers
 - `models.py`: built-in 3D models and STL loading
 - `telemetry.py`, `kinematics.py`, `motion_events.py`: parsing and sensor processing
 - `calibration.py`, `calibration_ui.py`, `session_io.py`: calibration and saved sessions
+- `fault_ui.py`: modeless live and demo fault window; `sources.py` handles real serial evidence and simulated faults
 - `firmware/`: STM32CubeIDE project and [firmware build notes](firmware/README.md)
 
 The motion labels are demonstration heuristics, not safety measurements. An MPU6050 estimates attitude and linear acceleration, but it cannot provide drift-free position or absolute yaw.

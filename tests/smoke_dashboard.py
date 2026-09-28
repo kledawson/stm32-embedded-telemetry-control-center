@@ -11,16 +11,34 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from PyQt6.QtCore import QPoint, QPointF, Qt
-from PyQt6.QtGui import QWheelEvent
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
+from PyQt6.QtGui import QMouseEvent, QWheelEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QScrollArea
+from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QPushButton, QScrollArea, QSlider
+from dashboard_ui import SCROLLBAR_STYLE, fit_window_to_screen
 from app import DemoWorker, TelemetryDashboard
 from session_io import load_session
 
 
 QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 app = QApplication([])
+
+
+class SmallScreen:
+    def availableGeometry(self):
+        return QRect(0, 0, 800, 600)
+
+
+class SmallScreenReference:
+    def screen(self):
+        return SmallScreen()
+
+
+probe = QDialog()
+fit_window_to_screen(probe, (1140, 770), (480, 460), SmallScreenReference())
+assert (probe.width(), probe.height()) == (752, 552), "Dialog exceeded a smaller screen"
+assert "background: #edf3fa" in SCROLLBAR_STYLE and "background: #1d5264" in SCROLLBAR_STYLE
+probe.close()
 window = TelemetryDashboard()
 window.show()
 window.activateWindow()
@@ -46,7 +64,9 @@ try:
     assert dialog.health_details.parentWidget().isVisible(), "Device-health details did not expand"
     dialog.profile_toggle.click()
     QTest.qWait(30)
-    assert dialog_area.widget().width() <= dialog_area.viewport().width(), "Expanded details overflowed narrow dialog"
+    assert dialog_area.widget().width() <= dialog_area.viewport().width(), (
+        f"Expanded details overflowed narrow dialog: content={dialog_area.widget().width()} "
+        f"viewport={dialog_area.viewport().width()} minimum={dialog_area.widget().minimumSizeHint().width()}")
     dialog.close()
     assert set(window.rail_sections) == {
         'STREAM CONTROL', 'SESSION CAPTURE + REPLAY', '3D ATTITUDE', 'MEMORY TOOLS', 'FIRMWARE TERMINAL'
@@ -140,14 +160,48 @@ try:
     assert not window.health_panel.isVisible(), "Session Health did not collapse"
     window.btn_health.click()
     assert window.health_panel.isVisible(), "Session Health did not expand"
+    window.log_message("SYS >> EXPANDED FILTER TEST")
     terminal_before_expand = window.terminal.toPlainText()
     window.expand_panel(window.terminal_panel)
     QTest.qWait(100)
     assert window.focus_overlay.source is window.terminal_panel, "Firmware Terminal did not expand"
     assert window.terminal.toPlainText() == terminal_before_expand, "Terminal content changed during expansion"
+    terminal_controls = window.focus_overlay.controls
+    assert terminal_controls.geometry().top() > window.terminal_panel.content.geometry().bottom(), \
+        "Expanded terminal controls are not docked below the output"
+    visible_timestamp = window.terminal_records[-1][0]
+    timestamps = terminal_controls.findChild(QPushButton, "focusTimestamps")
+    timestamps.click()
+    assert not window.btn_timestamps.isChecked() and visible_timestamp not in window.terminal.toPlainText(), \
+        "Expanded timestamp control did not update the terminal"
+    timestamps.click()
+    assert window.btn_timestamps.isChecked() and visible_timestamp in window.terminal.toPlainText()
+    system_filter = terminal_controls.findChild(QPushButton, "focusTerminal_SYS")
+    system_filter.click()
+    assert not window.terminal_filter_buttons['SYS'].isChecked()
+    assert 'SYS  EXPANDED FILTER TEST' not in window.terminal.toPlainText()
+    system_filter.click()
+    assert window.terminal_filter_buttons['SYS'].isChecked()
+    output_picker = terminal_controls.findChild(QComboBox, "focusTerminalRate")
+    output_picker.setCurrentIndex(2)
+    assert window.terminal_rate_slider.value() == 2
+    window.terminal_rate_slider.setValue(0)
+    assert output_picker.currentIndex() == 0, "Expanded terminal rate did not sync both ways"
+    terminal_controls.findChild(QPushButton, "focusHealth").click()
+    assert not window.health_panel.isVisible(), "Expanded Health control did not collapse details"
+    terminal_controls.findChild(QPushButton, "focusHealth").click()
+    assert window.health_panel.isVisible()
+    scroll.setValue(scroll.maximum() // 2)
+    assert not window.terminal_following
+    terminal_controls.findChild(QPushButton, "focusFollowLive").click()
+    assert window.terminal_following and scroll.value() == scroll.maximum(), \
+        "Expanded Follow live control did not resume terminal output"
+    if len(sys.argv) > 1:
+        window.grab().save(str(output / 'terminal-expanded.png'))
     window.focus_overlay.restore()
     QTest.qWait(100)
-    assert window.terminal.toPlainText() == terminal_before_expand, "Terminal content changed after restore"
+    assert 'SYS  EXPANDED FILTER TEST' in window.terminal.toPlainText(), \
+        "Terminal history was lost after restore"
     # Feed a later deterministic demo frame to make the screenshot informative.
     for i in range(100):
         s = DemoWorker.sample_at(2 + i * .03)
@@ -176,12 +230,41 @@ try:
     assert window.focus_overlay.source is window.accel_panel
     assert window.accel_panel.content is plot
     assert plot.viewRange() == before, "Expanded plot lost manual range"
+    graph_controls = window.focus_overlay.controls
+    assert graph_controls.geometry().top() > plot.geometry().bottom(), \
+        "Expanded graph controls are not docked below the plot"
+    graph_controls.findChild(QPushButton, "focusRate_f").click()
+    assert window.requested_interval == .5 and window.rate_buttons['f'].isChecked(), \
+        "Expanded graph rate did not update stream rate"
+    graph_controls.findChild(QPushButton, "focusRate_v").click()
+    assert window.requested_interval == .03 and window.rate_buttons['v'].isChecked()
+    if len(sys.argv) > 1:
+        window.grab().save(str(output / 'graph-expanded.png'))
     window.focus_overlay.restore()
     QTest.qWait(100)
     assert plot.viewRange() == before, "Restored plot lost manual range"
+    window.view_3d.setCameraPosition(distance=25, elevation=30, azimuth=45)
+    window.view_3d.mousePos = QPointF(0, 0)
+    azimuth_before_drag = window.view_3d.cameraParams()["azimuth"]
+    drag = QMouseEvent(QEvent.Type.MouseMove, QPointF(100, 0), Qt.MouseButton.NoButton,
+                       Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    window.view_3d.mouseMoveEvent(drag)
+    azimuth_change = window.view_3d.cameraParams()["azimuth"] - azimuth_before_drag
+    assert abs(azimuth_change + 25) < .01, f"3D orbit drag was not slowed: {azimuth_change}° per 100 px"
+    window.view_3d.setCameraPosition(distance=25, elevation=30, azimuth=45)
     window.expand_panel(window.model_panel)
     QTest.qWait(150)
     assert window.view_3d.cameraParams() == camera_before, "Camera reset on focus"
+    model_controls = window.focus_overlay.controls
+    assert model_controls.geometry().top() > window.model_panel.content.geometry().bottom(), \
+        "Expanded 3D controls are not docked below the view"
+    model_picker = model_controls.findChild(QComboBox, "focusModelPicker")
+    model_picker.setCurrentIndex(1)
+    assert window.model_combo.currentIndex() == 1 and window.active_mesh is not None
+    model_picker.setCurrentIndex(0)
+    model_controls.findChild(QPushButton, "focusReset").click()
+    assert window.latest_motion is None and (window.pitch, window.roll, window.yaw) == (0, 0, 0), \
+        "Expanded attitude reset did not reset orientation"
     if len(sys.argv) > 1:
         output = Path(sys.argv[1])
         output.mkdir(parents=True, exist_ok=True)
@@ -225,6 +308,18 @@ try:
     assert window.btn_step.isEnabled(), "Replay controls did not survive pane collapse/expand"
     window.btn_play_replay.click()
     assert window.paused and 'Play' in window.btn_play_replay.text(), "Replay did not pause"
+    window.expand_panel(window.gyro_panel)
+    replay_controls = window.focus_overlay.controls
+    replay_play = replay_controls.findChild(QPushButton, "focusReplayPlay")
+    replay_speed = replay_controls.findChild(QSlider, "focusReplaySpeedSlider")
+    assert 'Play' in replay_play.text()
+    replay_speed.setValue(0)
+    assert window.replay_speed_slider.value() == 0 and window.worker.speed == .25
+    replay_play.click()
+    assert not window.paused and 'Pause' in replay_play.text(), "Expanded Replay play did not resume"
+    replay_play.click()
+    assert window.paused and 'Play' in replay_play.text(), "Expanded Replay pause did not pause"
+    window.focus_overlay.restore()
     for index, speed in enumerate((.25, .5, 1., 2., 4.)):
         window.replay_speed_slider.setValue(index)
         assert window.worker.speed == speed and window.lbl_replay_speed.text() == f'{speed:g}×'
@@ -248,7 +343,9 @@ try:
     window.btn_connect.setFocus()
     QTest.keyClick(window, Qt.Key.Key_P)
     QTest.qWait(20)
-    assert window.paused and 'Play' in window.btn_play_replay.text(), "P did not pause replay"
+    assert window.paused and 'Play' in window.btn_play_replay.text(), (
+        f"P did not pause replay: paused={window.paused}, replay={window.is_replay_mode}, "
+        f"button={window.btn_play_replay.text()}, focus={app.focusWidget()}, worker={window.worker}")
     QTest.keyClick(window, Qt.Key.Key_P)
     QTest.qWait(20)
     assert not window.paused and 'Pause' in window.btn_play_replay.text(), "P did not resume replay"
@@ -258,7 +355,19 @@ try:
     window.render_frame(force=True)
     assert window.lbl_status.text() == 'OFFLINE'
     assert not window.btn_pause.isEnabled()
-    print('PASS: calibration dialog resize/details, collapsible left rail, terminal filters/health, demo record/replay/seek/step, plot/camera focus, pause, shortcuts, memory commands, slow-rate disconnect, offline state')
+    window.worker = DemoWorker()  # Feed timestamped samples without starting another thread.
+    window.reset_visual_session()
+    for timestamp in (0.0, .5, 29.0, 30.1):
+        window.ingest_telemetry(0, 0, 1, 0, 0, 0, .03,
+                                source_time_s=timestamp, record=False, report=False)
+    assert list(window.plot_times) == [.5, 29.0, 30.1], "Graph did not keep a 30-second window"
+    assert all(len(values) == len(window.plot_times) for values in window.data.values())
+    window.render_frame(force=True)
+    x_values, _ = window.accel_curves[0].getData()
+    assert list(x_values) == list(window.plot_times), "Plot no longer matches retained samples"
+    window.worker = None
+    window.reset_visual_session()
+    print('PASS: calibration resize/details, 30-second graphs, collapsible rail, expanded terminal/graph/3D/replay controls, demo record/replay/seek/step, pause, shortcuts, memory commands, slow-rate disconnect, offline state')
 finally:
     temporary_directory.cleanup()
     window.close()

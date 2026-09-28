@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import (QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+from PyQt6.QtWidgets import (QBoxLayout, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QProgressBar, QPushButton, QScrollArea, QToolButton, QVBoxLayout, QWidget)
 
 from calibration import FACES
+from dashboard_ui import SCROLLBAR_STYLE, fit_window_to_screen
 
 
 class CalibrationDialog(QDialog):
@@ -14,9 +15,8 @@ class CalibrationDialog(QDialog):
         super().__init__(dashboard)
         self.dashboard = dashboard
         self.setWindowTitle("Calibration & device health")
-        self.resize(720, 680)
-        self.setMinimumSize(360, 390)
-        self.setStyleSheet("""
+        fit_window_to_screen(self, (720, 680), (360, 390), dashboard)
+        self.setStyleSheet(SCROLLBAR_STYLE + """
             QDialog, QScrollArea, QWidget#calRoot { background: #0b0e14; color: #edf3fa; }
             QFrame#calCard { background: #151c28; border: 1px solid #2c3748; border-radius: 9px; }
             QLabel#calTitle { font-size: 20px; font-weight: 650; }
@@ -41,14 +41,17 @@ class CalibrationDialog(QDialog):
         body.setObjectName("calRoot")
         scroll.setWidget(body)
         column = QVBoxLayout(body)
+        self.column_layout = column
         column.setContentsMargins(6, 4, 12, 8)
         column.setSpacing(12)
 
         title = QLabel("Calibrate your sensor")
         title.setObjectName("calTitle")
+        title.setWordWrap(True)
         column.addWidget(title)
         self.source_label = QLabel()
         self.source_label.setObjectName("calSubtle")
+        self.source_label.setWordWrap(True)
         column.addWidget(self.source_label)
 
         guide = self._card(column)
@@ -97,8 +100,11 @@ class CalibrationDialog(QDialog):
         head.addStretch()
         self.health_state = QLabel("Offline")
         head.addWidget(self.health_state)
+        self.health_head = head
         health.addLayout(head)
         grid = QGridLayout()
+        self.health_grid = grid
+        self.health_cells = []
         grid.setSpacing(8)
         self.summary_labels = {}
         for index, (key, caption) in enumerate((
@@ -116,9 +122,11 @@ class CalibrationDialog(QDialog):
             box.addWidget(value)
             self.summary_labels[key] = value
             grid.addWidget(cell, index // 2, index % 2)
+            self.health_cells.append(cell)
         health.addLayout(grid)
         self.health_toggle, self.health_details = self._disclosure(health, "Technical details")
         self.detail_labels = {}
+        self.detail_rows = []
         for key, caption in (
             ("frames", "Validated frames"), ("missing", "Missing sequence numbers"),
             ("malformed", "Malformed frames"), ("reset", "Last reset reason"),
@@ -128,13 +136,16 @@ class CalibrationDialog(QDialog):
             row = QHBoxLayout()
             name = QLabel(caption)
             name.setObjectName("calSubtle")
+            name.setWordWrap(True)
             row.addWidget(name)
             row.addStretch()
             value = QLabel("—")
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            value.setWordWrap(True)
             row.addWidget(value)
             self.detail_labels[key] = value
             self.health_details.addLayout(row)
+            self.detail_rows.append(row)
         self.health_note = QLabel()
         self.health_note.setObjectName("calSubtle")
         self.health_note.setWordWrap(True)
@@ -159,8 +170,7 @@ class CalibrationDialog(QDialog):
         column.addWidget(card)
         return box
 
-    @staticmethod
-    def _disclosure(parent, title):
+    def _disclosure(self, parent, title):
         toggle = QToolButton()
         toggle.setText("▸  " + title)
         toggle.setCheckable(True)
@@ -172,8 +182,32 @@ class CalibrationDialog(QDialog):
         parent.addWidget(content)
         content.hide()
         toggle.toggled.connect(lambda open_: (content.setVisible(open_),
-            toggle.setText(("▾  " if open_ else "▸  ") + title)))
+            self._set_disclosure_label(toggle, title)))
         return toggle, layout
+
+    def _set_disclosure_label(self, toggle, title):
+        compact = "Saved profile" if self.width() < 520 and title.startswith("Saved profile") else title
+        toggle.setText(("▾  " if toggle.isChecked() else "▸  ") + compact)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not hasattr(self, "profile_toggle"):
+            return
+        narrow = self.width() < 520
+        if narrow:
+            self.column_layout.setContentsMargins(3, 4, 3, 8)
+        else:
+            self.column_layout.setContentsMargins(6, 4, 12, 8)
+        self.health_head.setDirection(QBoxLayout.Direction.TopToBottom if narrow else QBoxLayout.Direction.LeftToRight)
+        for row in self.detail_rows:
+            row.setDirection(QBoxLayout.Direction.TopToBottom if narrow else QBoxLayout.Direction.LeftToRight)
+        if getattr(self, "_narrow", None) != narrow:
+            for cell in self.health_cells:
+                self.health_grid.removeWidget(cell)
+            for index, cell in enumerate(self.health_cells):
+                self.health_grid.addWidget(cell, index if narrow else index // 2, 0 if narrow else index % 2)
+            self._narrow = narrow
+        self._set_disclosure_label(self.profile_toggle, "Saved profile & coefficients")
 
     def refresh(self):
         dashboard = self.dashboard
@@ -215,7 +249,10 @@ class CalibrationDialog(QDialog):
         for key in self.summary_labels:
             self.summary_labels[key].setText(metrics[key])
         for key in self.detail_labels:
-            self.detail_labels[key].setText(metrics[key])
+            value = metrics[key]
+            if key == "identity" and len(value) == 24:
+                value = " ".join(value[index:index + 8] for index in range(0, 24, 8))
+            self.detail_labels[key].setText(value)
         self.health_note.setText(metrics["note"])
         profile = dashboard.current_profile
         if profile is None:

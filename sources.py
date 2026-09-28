@@ -1,6 +1,7 @@
 """Live serial, demo, and replay workers for the dashboard."""
 
 import math
+import random
 import time
 from collections import deque
 from threading import Event, Lock
@@ -9,7 +10,8 @@ import serial
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from session_io import Session
-from telemetry import TelemetrySample, is_checksum_failure, parse_firmware_health, parse_telemetry_line
+from telemetry import (TelemetrySample, encode_telemetry,
+                       is_checksum_failure, parse_firmware_health, parse_telemetry_line)
 
 
 # --- BACKGROUND SERIAL WORKER ---
@@ -18,6 +20,9 @@ class SerialWorker(QThread):
     log_received = pyqtSignal(str)
     sequence_received = pyqtSignal(object)
     health_received = pyqtSignal(object)
+    fault_marker_received = pyqtSignal(str)
+    rejected_frame_received = pyqtSignal(str)
+    accepted_frame_received = pyqtSignal(str)
 
     def __init__(self, port, baud=115200):
         super().__init__()
@@ -57,6 +62,7 @@ class SerialWorker(QThread):
     def _handle_line(self, line: str):
         if not line:
             return
+        accepted_line = line
         sample = parse_telemetry_line(line)
         if sample is None:
             # If an unterminated prefix is followed by a complete telemetry
@@ -65,6 +71,7 @@ class SerialWorker(QThread):
             if final_packet_start > 0:
                 sample = parse_telemetry_line(line[final_packet_start:])
                 if sample is not None:
+                    accepted_line = line[final_packet_start:]
                     self.recovered_frames += 1
         if sample is not None:
             self.synchronized = True
@@ -72,6 +79,7 @@ class SerialWorker(QThread):
             dt = now - self.last_time if self.last_time else 0.03
             self.last_time = now
             self.sequence_received.emit(sample.sequence)
+            self.accepted_frame_received.emit(accepted_line)
             self.data_received.emit(sample.ax, sample.ay, sample.az, sample.gx, sample.gy, sample.gz, dt)
         elif line.startswith("AX:"):
             # Opening a serial port can start in the middle of an
@@ -82,10 +90,13 @@ class SerialWorker(QThread):
             self.invalid_frames += 1
             if is_checksum_failure(line):
                 self.checksum_failures += 1
+                self.rejected_frame_received.emit(line)
             self.invalid_frame_examples.append(line)
             if self.invalid_frames == 1 or self.invalid_frames % 50 == 0:
                 self.log_received.emit(f"WARN >> REJECTED {self.invalid_frames} INVALID TELEMETRY FRAME(S)")
         else:
+            if line.startswith("[FAULT]:"):
+                self.fault_marker_received.emit(line)
             health = parse_firmware_health(line)
             if health is not None or (line.startswith("[SYS STATUS]:") and "UID:" not in line):
                 self.health_received.emit(health)
@@ -100,6 +111,8 @@ class SerialWorker(QThread):
             self.ser.flush()
             if cmd == 'p':
                 self.last_time = time.monotonic()
+            return True
+        return False
 
     def stop(self):
         self.running = False
@@ -113,6 +126,9 @@ class DemoWorker(QThread):
 
     data_received = pyqtSignal(float, float, float, float, float, float, float)
     log_received = pyqtSignal(str)
+    fault_event = pyqtSignal(str)
+    rejected_frame_received = pyqtSignal(str)
+    accepted_frame_received = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -121,18 +137,109 @@ class DemoWorker(QThread):
         self.interval = 0.03
         self.stop_event = Event()
         self.started_at = time.monotonic()
+        self.invalid_frames = 0
+        self.checksum_failures = 0
+        self._fault_lock = Lock()
+        self._fault_kind = None
+        self._fault_phase = None
+        self._fault_started_at = 0.0
+        self._fault_duration = 0.0
+        self._random = random.Random()
+        self._sequence = 0
+
+    @property
+    def fault_state(self):
+        with self._fault_lock:
+            return self._fault_kind, self._fault_phase
+
+    def inject_fault(self, kind):
+        if kind not in ("checksum", "mutex", "watchdog"):
+            return False
+        with self._fault_lock:
+            if self._fault_kind is not None or not self.running:
+                return False
+            self._fault_kind = kind
+            self._fault_phase = "pending"
+            self._fault_started_at = time.monotonic()
+            self._fault_duration = self._random.uniform(.28, .42) if kind == "mutex" else 0.0
+        self.stop_event.set()
+        return True
 
     def run(self):
         self.log_received.emit("SYS >> DEMO SOURCE ACTIVE · SIMULATED MPU6050")
         previous = time.monotonic()
         while self.running:
             now = time.monotonic()
-            if not self.paused:
-                sample = self.sample_at(now - self.started_at)
-                self.data_received.emit(sample.ax, sample.ay, sample.az,
-                                        sample.gx, sample.gy, sample.gz, now - previous)
+            with self._fault_lock:
+                kind, phase = self._fault_kind, self._fault_phase
+                elapsed = now - self._fault_started_at
+                if kind == "mutex" and phase == "visible" and elapsed >= self._fault_duration:
+                    self._fault_kind = self._fault_phase = None
+                    phase = "released"
+                    self.fault_event.emit("mutex_released")
+                    self.log_received.emit("SYS >> DEMO UART MUTEX RELEASED · TELEMETRY RESUMED")
+                if kind == "watchdog" and phase == "stalled" and elapsed >= 1.8:
+                    self._fault_phase = "rebooting"
+                    phase = "rebooting"
+                    self.fault_event.emit("watchdog_reset")
+                    self.log_received.emit("WARN >> DEMO WATCHDOG EXPIRED · TELEMETRY TASK RESTARTING")
+                elif kind == "watchdog" and phase == "rebooting" and elapsed >= 3.0:
+                    self._fault_kind = self._fault_phase = None
+                    self.started_at = now
+                    kind = phase = None
+                    self.fault_event.emit("watchdog_recovered")
+                    self.log_received.emit("SYS >> DEMO BOOT COMPLETE · RESET REASON IWDG · TELEMETRY RESUMED")
+                elif phase == "pending":
+                    self._fault_phase = "stalled" if kind == "watchdog" else "visible"
+                    phase = self._fault_phase
+                    self.fault_event.emit(f"{kind}_detected")
+                    if kind == "mutex":
+                        self.log_received.emit("WARN >> DEMO UART MUTEX HELD · TELEMETRY WAITS")
+                    elif kind == "watchdog":
+                        self.log_received.emit("WARN >> DEMO TELEMETRY TASK STALLED · WATCHDOG NOT REFRESHED")
+            if not self.paused and kind == "checksum" and phase == "visible":
+                # Exercise the same checksum validator as the serial source.
+                sample = self._next_sample(now - self.started_at)
+                original = encode_telemetry(sample)
+                payload, _, checksum = original.partition("|CHK:")
+                digit = next(index for index in range(3, len(payload)) if payload[index].isdigit())
+                damaged = f"{payload[:digit]}{chr(ord(payload[digit]) ^ 1)}{payload[digit + 1:]}|CHK:{checksum}"
+                if parse_telemetry_line(damaged) is None and is_checksum_failure(damaged):
+                    self.invalid_frames += 1
+                    self.checksum_failures += 1
+                    self.rejected_frame_received.emit(damaged)
+                    self.fault_event.emit("checksum_rejected")
+                    self.log_received.emit("WARN >> DEMO CHECKSUM MISMATCH · FRAME REJECTED BEFORE PLOTTING")
+                with self._fault_lock:
+                    if self._fault_kind == "checksum":
+                        self._fault_phase = "shown"
+            elif not self.paused and kind not in ("mutex", "watchdog"):
+                sample = self._next_sample(now - self.started_at)
+                valid_line = encode_telemetry(sample)
+                accepted = parse_telemetry_line(valid_line)
+                if accepted is not None:
+                    if kind == "checksum" and phase == "shown":
+                        self.accepted_frame_received.emit(valid_line)
+                        with self._fault_lock:
+                            self._fault_kind = self._fault_phase = None
+                    self.data_received.emit(accepted.ax, accepted.ay, accepted.az,
+                                            accepted.gx, accepted.gy, accepted.gz, now - previous)
             previous = now
-            self.stop_event.wait(self.interval)
+            self.stop_event.wait(min(self.interval, 0.05) if kind == "watchdog" else self.interval)
+            self.stop_event.clear()
+
+    def _next_sample(self, t):
+        base = self.sample_at(t)
+        self._sequence += 1
+        return TelemetrySample(
+            base.ax + self._random.uniform(-.018, .018),
+            base.ay + self._random.uniform(-.018, .018),
+            base.az + self._random.uniform(-.018, .018),
+            base.gx + self._random.uniform(-.25, .25),
+            base.gy + self._random.uniform(-.25, .25),
+            base.gz + self._random.uniform(-.25, .25),
+            sequence=self._sequence,
+        )
 
     @staticmethod
     def sample_at(t):

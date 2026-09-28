@@ -13,31 +13,58 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
 from kinematics import AttitudeEstimator
-from dashboard_ui import STYLE, Panel, CollapsibleSection, FocusOverlay, RailScrollArea
+from dashboard_ui import STYLE, Panel, CollapsibleSection, FocusOverlay, RailScrollArea, fit_window_to_screen
 from motion_events import MotionEvents
-from telemetry import TelemetrySample
+from telemetry import TelemetrySample, calculate_checksum, parse_telemetry_line
 from session_io import Session, SessionRecorder, SessionSample, load_session
 from calibration import CalibrationWizard, load_profile, save_profile
 from calibration_ui import CalibrationDialog
+from fault_ui import FaultLabDialog
 from sources import SerialWorker, DemoWorker, ReplayWorker
 from models import create_aircraft_mesh, create_satellite_mesh, create_drone_mesh, create_stl_mesh
+
+
+class SteadyGLViewWidget(gl.GLViewWidget):
+    """Keep camera orbit and pan proportional, but less twitchy during drags."""
+
+    drag_sensitivity = 0.25
+
+    def mouseMoveEvent(self, event):
+        buttons = event.buttons()
+        if buttons not in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
+            return super().mouseMoveEvent(event)
+        position = event.position()
+        if not hasattr(self, "mousePos"):
+            self.mousePos = position
+        delta = (position - self.mousePos) * self.drag_sensitivity
+        self.mousePos = position
+        if buttons == Qt.MouseButton.LeftButton:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.pan(delta.x(), delta.y(), 0, relative="view")
+            else:
+                self.orbit(-delta.x(), delta.y())
+        elif event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.pan(delta.x(), 0, delta.y(), relative="view-upright")
+        else:
+            self.pan(delta.x(), delta.y(), 0, relative="view-upright")
+        event.accept()
+
 
 class TelemetryDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("STM32 Telemetry Console")
-        self.resize(1440, 900)
-        self.setMinimumSize(1060, 730)
+        fit_window_to_screen(self, (1440, 900), (1060, 730))
         self.setStyleSheet(STYLE)
         self.worker = None
-        self.max_points = 300
+        self.plot_window_s = 30.0
         self.button_map = {}
         self.estimator = AttitudeEstimator()
         self.events = MotionEvents()
         self.active_mesh = None
         self.last_model_index = 0
-        self.data = {axis: deque(maxlen=self.max_points) for axis in ('ax', 'ay', 'az', 'gx', 'gy', 'gz')}
-        self.plot_times = deque(maxlen=self.max_points)
+        self.data = {axis: deque() for axis in ('ax', 'ay', 'az', 'gx', 'gy', 'gz')}
+        self.plot_times = deque()
         self.sample_timestamps = deque(maxlen=120)
         self.serial_interval_samples = deque(maxlen=120)
         self.frame_timestamps = deque(maxlen=120)
@@ -64,6 +91,41 @@ class TelemetryDashboard(QMainWindow):
         self.terminal_following = True
         self._terminal_rendering = False
         self.calibration_dialog = None
+        self.fault_dialog = None
+        self.demo_fault_kind = None
+        self.demo_fault_phase = "idle"
+        self.demo_rejected_frames = 0
+        self.demo_reset_reason = None
+        self.demo_fault_detail = ""
+        self.demo_fault_started_at = 0.0
+        self.demo_fault_gap_start = None
+        self.demo_fault_gap_ms = None
+        self.demo_fault_packet = None
+        self.demo_fault_next_frame = None
+        self.demo_fault_hold_at = None
+        self.demo_fault_release_at = None
+        self.demo_fault_stale_at = None
+        self.demo_fault_reboot_at = None
+        self.demo_fault_first_return_at = None
+        self.demo_fault_recovered_at = None
+        self.demo_fault_frame_times = []
+        self.live_fault_kind = None
+        self.live_fault_phase = "idle"
+        self.live_fault_detail = ""
+        self.live_fault_started_at = 0.0
+        self.live_fault_gap_start = None
+        self.live_fault_gap_ms = None
+        self.live_fault_packet = None
+        self.live_fault_next_frame = None
+        self.live_fault_hold_at = None
+        self.live_fault_release_at = None
+        self.live_fault_stale_at = None
+        self.live_fault_reboot_at = None
+        self.live_fault_first_return_at = None
+        self.live_fault_recovered_at = None
+        self.live_fault_frame_times = []
+        self.live_fault_reconnect_port = None
+        self.live_fault_reconnecting = False
         self.calibration_wizard = CalibrationWizard()
         self.current_profile = None
         self.firmware_health = None
@@ -114,6 +176,10 @@ class TelemetryDashboard(QMainWindow):
         self.btn_calibrate.setToolTip("Guided sensor calibration and live device diagnostics")
         self.btn_calibrate.clicked.connect(self.open_calibration)
         bar.addWidget(self.btn_calibrate)
+        self.btn_fault_lab = QPushButton("Fault Injection")
+        self.btn_fault_lab.setToolTip("Show deliberate faults using demo or live firmware data")
+        self.btn_fault_lab.clicked.connect(self.open_fault_lab)
+        bar.addWidget(self.btn_fault_lab)
         self.port_combo = QComboBox()
         self.port_combo.setMinimumWidth(200)
         self.refresh_ports()
@@ -335,7 +401,7 @@ class TelemetryDashboard(QMainWindow):
         model_layout = QVBoxLayout(model_body)
         model_layout.setContentsMargins(0, 0, 0, 0)
         model_layout.setSpacing(5)
-        self.view_3d = gl.GLViewWidget()
+        self.view_3d = SteadyGLViewWidget()
         self.view_3d.setMinimumSize(280, 160)
         self.view_3d.setCameraPosition(distance=25, elevation=30, azimuth=45)
         self.view_3d.setBackgroundColor('#101923')
@@ -353,7 +419,7 @@ class TelemetryDashboard(QMainWindow):
         model_layout.addWidget(self.view_3d, 1)
         self.lbl_angles = self.label("Pitch  0.0°     Roll  0.0°     Yaw  0.0°", "muted")
         self.lbl_angles.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_angles.setToolTip("Drag to orbit the camera; wheel to zoom. Cyan vector: estimated linear acceleration.")
+        self.lbl_angles.setToolTip("Drag gently to orbit · Ctrl+drag to pan · wheel to zoom. Cyan vector: estimated linear acceleration.")
         model_layout.addWidget(self.lbl_angles)
         self.model_panel = Panel("3D Attitude", model_body, self.expand_panel)
         hero.addWidget(self.model_panel)
@@ -493,7 +559,107 @@ class TelemetryDashboard(QMainWindow):
         return graph
 
     def expand_panel(self, panel):
-        self.focus_overlay.expand(panel)
+        self.focus_overlay.expand(panel, self.make_focus_controls(panel))
+        self.sync_focus_controls()
+
+    def linked_focus_button(self, text, source, name):
+        button = QPushButton(text)
+        button.setObjectName(name)
+        button.setCheckable(source.isCheckable())
+        if source.isCheckable():
+            button.setChecked(source.isChecked())
+            source.toggled.connect(button.setChecked)
+        button.setEnabled(source.isEnabled())
+        button.clicked.connect(source.click)
+        return button
+
+    def make_focus_controls(self, panel):
+        controls = QFrame()
+        controls.setObjectName("focusControls")
+        box = QVBoxLayout(controls)
+        box.setContentsMargins(10, 8, 10, 8)
+        box.setSpacing(6)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        box.addLayout(row)
+
+        if panel is self.model_panel:
+            row.addWidget(self.label("MODEL", "section"))
+            picker = QComboBox()
+            picker.setObjectName("focusModelPicker")
+            picker.addItems(self.model_combo.itemText(index) for index in range(self.model_combo.count()))
+            picker.setCurrentIndex(self.model_combo.currentIndex())
+            picker.currentIndexChanged.connect(self.model_combo.setCurrentIndex)
+            self.model_combo.currentIndexChanged.connect(picker.setCurrentIndex)
+            row.addWidget(picker)
+            row.addWidget(self.linked_focus_button("Reset attitude  [R]", self.btn_reset_yaw, "focusReset"))
+            row.addStretch()
+        elif panel in (self.accel_panel, self.gyro_panel):
+            if self.is_replay_mode:
+                row.addWidget(self.label("REPLAY", "section"))
+                row.addWidget(self.linked_focus_button(self.btn_play_replay.text(),
+                                                       self.btn_play_replay, "focusReplayPlay"))
+                row.addWidget(self.label("SPEED", "section"))
+                slider = QSlider(Qt.Orientation.Horizontal)
+                slider.setObjectName("focusReplaySpeedSlider")
+                slider.setRange(0, len(self.replay_speeds) - 1)
+                slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+                slider.setTickInterval(1)
+                slider.setValue(self.replay_speed_slider.value())
+                slider.valueChanged.connect(self.replay_speed_slider.setValue)
+                self.replay_speed_slider.valueChanged.connect(slider.setValue)
+                row.addWidget(slider, 1)
+                speed = self.label(self.lbl_replay_speed.text(), "healthValue")
+                speed.setObjectName("focusReplaySpeed")
+                row.addWidget(speed)
+            else:
+                row.addWidget(self.label("STREAM RATE", "section"))
+                for key, title in (("v", "33 Hz"), ("f", "2 Hz"), ("n", "1 Hz"), ("s", "0.5 Hz")):
+                    row.addWidget(self.linked_focus_button(title, self.rate_buttons[key], f"focusRate_{key}"))
+                row.addStretch()
+        elif panel is self.terminal_panel:
+            row.addWidget(self.label("SHOW", "section"))
+            for category in ("SYS", "TEL", "EVT", "WARN"):
+                row.addWidget(self.linked_focus_button(category, self.terminal_filter_buttons[category],
+                                                       f"focusTerminal_{category}"))
+            row.addStretch()
+            output_row = QHBoxLayout()
+            output_row.setSpacing(6)
+            output_row.addWidget(self.linked_focus_button("Timestamps", self.btn_timestamps, "focusTimestamps"))
+            output_row.addWidget(self.linked_focus_button("Health", self.btn_health, "focusHealth"))
+            output_row.addSpacing(8)
+            output_row.addWidget(self.label("OUTPUT RATE", "section"))
+            output_picker = QComboBox()
+            output_picker.setObjectName("focusTerminalRate")
+            output_picker.addItems(label for _, label in self.terminal_rate_options)
+            output_picker.setCurrentIndex(self.terminal_rate_slider.value())
+            output_picker.currentIndexChanged.connect(self.terminal_rate_slider.setValue)
+            self.terminal_rate_slider.valueChanged.connect(output_picker.setCurrentIndex)
+            output_row.addWidget(output_picker)
+            output_row.addWidget(self.linked_focus_button("Follow live", self.btn_resume_terminal,
+                                                          "focusFollowLive"))
+            output_row.addStretch()
+            box.addLayout(output_row)
+        else:
+            return None
+        return controls
+
+    def sync_focus_controls(self):
+        if not hasattr(self, "focus_overlay") or self.focus_overlay.controls is None:
+            return
+        controls = self.focus_overlay.controls
+        for key, source in self.rate_buttons.items():
+            button = controls.findChild(QPushButton, f"focusRate_{key}")
+            if button is not None:
+                button.setEnabled(source.isEnabled())
+                button.setChecked(source.isChecked())
+        play = controls.findChild(QPushButton, "focusReplayPlay")
+        if play is not None:
+            play.setText(self.btn_play_replay.text())
+            play.setEnabled(self.btn_play_replay.isEnabled())
+        speed = controls.findChild(QSlider, "focusReplaySpeedSlider")
+        if speed is not None:
+            speed.setEnabled(self.replay_speed_slider.isEnabled())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -518,6 +684,7 @@ class TelemetryDashboard(QMainWindow):
         for key in 'vfnspdc':
             self.button_map[key].setEnabled(enabled and not self.is_replay_mode)
         self.port_combo.setEnabled(not enabled)
+        self.sync_focus_controls()
 
     def set_session_controls(self):
         active = self.worker is not None
@@ -533,6 +700,7 @@ class TelemetryDashboard(QMainWindow):
         self.replay_slider.setEnabled(replay_active)
         self.replay_speed_slider.setEnabled(replay_active)
         self.btn_step.setEnabled(replay_active)
+        self.sync_focus_controls()
 
     def change_3d_model(self, index):
         factories = [create_aircraft_mesh, create_satellite_mesh, create_drone_mesh]
@@ -562,6 +730,12 @@ class TelemetryDashboard(QMainWindow):
         self.model_combo.blockSignals(True)
         self.model_combo.setCurrentIndex(self.last_model_index)
         self.model_combo.blockSignals(False)
+        if self.focus_overlay.controls is not None:
+            picker = self.focus_overlay.controls.findChild(QComboBox, "focusModelPicker")
+            if picker is not None:
+                picker.blockSignals(True)
+                picker.setCurrentIndex(self.last_model_index)
+                picker.blockSignals(False)
 
     def reset_yaw(self):
         self.estimator.reset()
@@ -590,6 +764,246 @@ class TelemetryDashboard(QMainWindow):
         self.calibration_dialog.show()
         self.calibration_dialog.raise_()
         self.calibration_dialog.activateWindow()
+
+    def open_fault_lab(self):
+        if self.fault_dialog is None:
+            self.fault_dialog = FaultLabDialog(self)
+            self.fault_dialog.setWindowModality(Qt.WindowModality.NonModal)
+        self.fault_dialog.refresh()
+        self.fault_dialog.show()
+        self.fault_dialog.raise_()
+        self.fault_dialog.activateWindow()
+
+    def start_demo_for_fault_lab(self):
+        if self.worker is not None:
+            return
+        self.port_combo.setCurrentIndex(0)
+        self.toggle_connection()
+        if self.fault_dialog is not None:
+            self.fault_dialog.record_event("Demo source connected · ready to inject")
+            self.fault_dialog.refresh()
+
+    def inject_live_fault(self, kind):
+        commands = {"checksum": "x", "watchdog": "w", "mutex": "m"}
+        worker = self.worker
+        if (kind not in commands or not isinstance(worker, SerialWorker) or
+                not worker.isRunning() or self.paused or self.last_sample_at is None or
+                time.monotonic() - self.last_sample_at > 1.5 or
+                self.live_fault_phase in ("sent", "armed", "stalled", "contending", "recovering")):
+            return False
+        try:
+            if not worker.send_cmd(commands[kind]):
+                return False
+        except Exception as error:
+            self.log_message(f"WARN >> FAULT COMMAND FAILED · {error}")
+            return False
+        self.live_fault_kind = kind
+        self.live_fault_phase = "sent"
+        self.live_fault_started_at = time.monotonic()
+        self.live_fault_detail = "Command sent; waiting for the board to acknowledge it."
+        self.live_fault_gap_start = None
+        self.live_fault_gap_ms = None
+        self.live_fault_packet = None
+        self.live_fault_next_frame = None
+        self.live_fault_hold_at = None
+        self.live_fault_release_at = None
+        self.live_fault_stale_at = None
+        self.live_fault_reboot_at = None
+        self.live_fault_first_return_at = None
+        self.live_fault_recovered_at = None
+        self.live_fault_frame_times = list(self.sample_timestamps)[-12:] if kind in ("mutex", "watchdog") else []
+        if kind == "watchdog":
+            self.live_fault_gap_start = self.last_sample_at
+        if kind == "watchdog" and self.session_recorder is not None:
+            self.stop_recording("watchdog test started")
+        self.log_message(f"SYS >> LIVE FAULT TEST SENT · {kind.upper()}")
+        if self.fault_dialog is not None:
+            self.fault_dialog.record_event(f"COM3 command sent · {kind} · awaiting firmware marker")
+            self.fault_dialog.refresh()
+        return True
+
+    def on_live_fault_marker(self, source, marker):
+        if self.worker is not source or self.live_fault_phase not in ("sent", "armed", "contending"):
+            return
+        expected = {"checksum": "CHECKSUM ARMED", "watchdog": "WATCHDOG STARVE",
+                    "mutex": "MUTEX HOLD"}
+        if marker == f"[FAULT]: {expected.get(self.live_fault_kind)}":
+            self.live_fault_phase = "contending" if self.live_fault_kind == "mutex" else "armed"
+            self.live_fault_detail = ("StatusTask owns the UART mutex; telemetry is waiting." if self.live_fault_kind == "mutex" else
+                                      "TelemetryTask is no longer feeding IWDG." if self.live_fault_kind == "watchdog" else
+                                      "The next real sensor packet will have one payload bit flipped on the board.")
+            if self.live_fault_kind == "mutex":
+                self.live_fault_gap_start = self.last_sample_at
+                self.live_fault_hold_at = time.monotonic()
+            if self.fault_dialog is not None:
+                self.fault_dialog.record_event(marker.removeprefix("[FAULT]: ").capitalize() + " · board acknowledged")
+        elif marker == "[FAULT]: MUTEX RELEASED" and self.live_fault_kind == "mutex" and self.live_fault_phase == "contending":
+            self.live_fault_release_at = time.monotonic()
+            self.live_fault_phase = "recovering"
+            self.live_fault_detail = "Mutex released; waiting for the next valid frame."
+            if self.fault_dialog is not None:
+                self.fault_dialog.record_event("UART mutex released · waiting for telemetry")
+        if self.fault_dialog is not None:
+            self.fault_dialog.refresh()
+
+    def on_live_rejected_frame(self, source, line):
+        if (self.worker is not source or self.live_fault_kind != "checksum" or
+                self.live_fault_phase != "armed"):
+            return
+        packet = self._bit_flip_evidence(line)
+        if packet is None:
+            return
+        self.live_fault_packet = packet
+        self.live_fault_phase = "recovering"
+        self.live_fault_detail = (f"Board sent CHK {packet['sent_checksum']}; received payload calculates to "
+                                  f"{packet['calculated_checksum']}. Parser rejected this frame.")
+        self.log_message("WARN >> LIVE CHECKSUM FAULT · FRAME REJECTED BEFORE GRAPH UPDATE")
+        if self.fault_dialog is not None:
+            self.fault_dialog.record_event(self.live_fault_detail)
+            self.fault_dialog.refresh()
+
+    @staticmethod
+    def _bit_flip_evidence(line):
+        payload, separator, suffix = line.partition("|CHK:0x")
+        if not separator:
+            return None
+        # The firmware flips bit 0 of the first numeric AX character. Undoing
+        # that bit gives a byte-for-byte before/after view of this real frame.
+        flipped_index = next((index for index in range(3, len(payload)) if payload[index].isdigit()), None)
+        original_payload = None
+        if flipped_index is not None:
+            original_payload = (payload[:flipped_index] + chr(ord(payload[flipped_index]) ^ 1) +
+                                payload[flipped_index + 1:])
+        try:
+            sent_checksum = int(suffix, 16)
+        except ValueError:
+            return None
+        reconstructed = original_payload is not None and calculate_checksum(original_payload) == sent_checksum
+        return {
+            "before_ax": original_payload.partition("|")[0] if reconstructed else "Original unavailable",
+            "after_ax": payload.partition("|")[0],
+            "before_byte": f"0x{ord(original_payload[flipped_index]):02X}" if reconstructed else "—",
+            "after_byte": f"0x{ord(payload[flipped_index]):02X}" if flipped_index is not None else "—",
+            "sent_checksum": f"0x{sent_checksum:02X}",
+            "calculated_checksum": f"0x{calculate_checksum(payload):02X}",
+        }
+
+    def on_live_accepted_frame(self, source, line):
+        if (self.worker is not source or self.live_fault_kind != "checksum" or
+                self.live_fault_phase != "recovering" or self.live_fault_next_frame is not None):
+            return
+        sample = parse_telemetry_line(line)
+        if sample is not None:
+            self.live_fault_next_frame = {
+                "ax": line.partition("|")[0],
+                "sequence": sample.sequence,
+                "checksum": line.rpartition("|CHK:")[2],
+            }
+
+    def update_live_fault(self, now):
+        phase, kind = self.live_fault_phase, self.live_fault_kind
+        if phase not in ("sent", "armed", "stalled", "contending", "recovering"):
+            return
+        if kind == "watchdog" and phase == "armed" and self.last_sample_at is not None and now - self.last_sample_at > .55:
+            self.live_fault_phase = "stalled"
+            self.live_fault_stale_at = now
+            self.live_fault_detail = "Telemetry stopped; waiting for the hardware watchdog to reset the MCU."
+            if self.fault_dialog is not None:
+                self.fault_dialog.record_event("Real COM3 telemetry became stale · watchdog countdown in hardware")
+        timeout = 25.0 if kind == "watchdog" else 8.0
+        if now - self.live_fault_started_at > timeout:
+            self.live_fault_phase = "failed"
+            self.live_fault_detail = "Could not verify the expected board response. Check that the updated firmware is flashed."
+            if self.fault_dialog is not None:
+                self.fault_dialog.record_event("Test unconfirmed · expected firmware evidence did not arrive")
+
+    def inject_demo_fault(self, kind):
+        worker = self.worker
+        if (kind not in ("checksum", "mutex", "watchdog") or
+                not isinstance(worker, DemoWorker) or not worker.isRunning() or self.paused):
+            return False
+        if self.demo_fault_phase in ("active", "rebooting", "recovering"):
+            return False
+        if not worker.inject_fault(kind):
+            return False
+        now = time.monotonic()
+        self.demo_fault_kind, self.demo_fault_phase = kind, "active"
+        self.demo_fault_detail = "Simulated command sent; waiting for the fault event."
+        self.demo_fault_started_at = now
+        self.demo_fault_gap_start = self.last_sample_at if kind == "watchdog" else None
+        self.demo_fault_gap_ms = None
+        self.demo_fault_packet = self.demo_fault_next_frame = None
+        self.demo_fault_hold_at = self.demo_fault_release_at = None
+        self.demo_fault_stale_at = self.demo_fault_reboot_at = None
+        self.demo_fault_first_return_at = self.demo_fault_recovered_at = None
+        self.demo_fault_frame_times = list(self.sample_timestamps)[-12:] if kind in ("mutex", "watchdog") else []
+        if kind == "watchdog" and self.session_recorder is not None:
+            self.stop_recording("simulated watchdog test started")
+        if self.fault_dialog is not None:
+            self.fault_dialog.record_event(f"Demo {kind} fault triggered · waiting for simulated evidence")
+        self.btn_pause.setEnabled(False)
+        if self.fault_dialog is not None:
+            self.fault_dialog.refresh()
+        self.update_stats(time.monotonic())
+        return True
+
+    def on_demo_fault_event(self, source, event):
+        if self.worker is not source:
+            return
+        details = {
+            "checksum_detected": "Next simulated packet selected for a one-bit change",
+            "checksum_rejected": "Checksum validator rejected the changed packet · graph did not ingest it",
+            "mutex_detected": "Simulated status task holds UART mutex · packets pause",
+            "mutex_released": "UART mutex released · waiting for next valid packet",
+            "watchdog_detected": "Telemetry task stalled · watchdog refresh stopped",
+            "watchdog_reset": "Watchdog expired · simulated MCU reboot cleared plots and attitude",
+            "watchdog_recovered": "Boot complete · reset reason IWDG · telemetry resumed",
+        }
+        now = time.monotonic()
+        if event == "mutex_detected":
+            self.demo_fault_hold_at = now
+            self.demo_fault_gap_start = self.last_sample_at
+        elif event == "mutex_released":
+            self.demo_fault_release_at = now
+            self.demo_fault_phase = "recovering"
+        elif event == "checksum_rejected":
+            self.demo_rejected_frames += 1
+            self.demo_fault_phase = "recovering"
+        elif event == "watchdog_reset":
+            if self.session_recorder is not None:
+                self.stop_recording("simulated watchdog reboot")
+                self.log_message("SYS >> RECORDING SAVED BEFORE SIMULATED WATCHDOG REBOOT")
+            self.demo_fault_phase = "rebooting"
+            self.demo_fault_reboot_at = now
+            self.demo_fault_stale_at = now
+            self.reset_visual_session()
+            self.render_frame(force=True)
+        elif event == "watchdog_recovered":
+            self.demo_fault_phase = "recovering"
+            self.demo_reset_reason = "IWDG (demo)"
+            self.session_started = time.monotonic()
+        if event in details:
+            self.demo_fault_detail = details[event]
+        if self.fault_dialog is not None and event in details:
+            self.fault_dialog.record_event(details[event])
+            self.fault_dialog.refresh()
+        self.update_stats(time.monotonic())
+
+    def on_demo_rejected_frame(self, source, line):
+        if self.worker is source and self.demo_fault_kind == "checksum":
+            self.demo_fault_packet = self._bit_flip_evidence(line)
+            if self.demo_fault_packet is not None and self.fault_dialog is not None:
+                self.fault_dialog.refresh()
+
+    def on_demo_accepted_frame(self, source, line):
+        if self.worker is source and self.demo_fault_kind == "checksum":
+            sample = parse_telemetry_line(line)
+            if sample is not None:
+                self.demo_fault_next_frame = {
+                    "ax": line.partition("|")[0],
+                    "sequence": sample.sequence,
+                    "checksum": line.rpartition("|CHK:")[2],
+                }
 
     def start_calibration(self):
         if not self.is_live_serial() or self.paused or self.session_recorder is not None:
@@ -639,6 +1053,16 @@ class TelemetryDashboard(QMainWindow):
         if self.worker is not source:
             return
         self.firmware_health = health
+        if (health is not None and self.live_fault_kind == "watchdog" and
+                self.live_fault_phase in ("armed", "stalled") and
+                health.reset_reason == "IWDG"):
+            self.reset_visual_session()
+            self.live_fault_phase = "recovering"
+            self.live_fault_detail = "Boot report confirms IWDG reset. Waiting for a fresh sensor frame."
+            self.log_message("SYS >> LIVE WATCHDOG RECOVERY · RESET REASON IWDG CONFIRMED")
+            if self.fault_dialog is not None:
+                self.fault_dialog.record_event("Firmware rebooted · boot report says Reset: IWDG")
+                self.fault_dialog.refresh()
         key = f"uid:{health.device_uid}" if health else f"port:{self.port_combo.currentText()}"
         profile = load_profile(key)
         if profile != self.current_profile:
@@ -720,6 +1144,15 @@ class TelemetryDashboard(QMainWindow):
             self.disconnect_source()
             return
         port = self.port_combo.currentText()
+        if not self.live_fault_reconnecting:
+            self.live_fault_kind = None
+            self.live_fault_phase = "idle"
+            self.live_fault_detail = ""
+            self.live_fault_reconnect_port = None
+        self.live_fault_reconnecting = False
+        self.demo_fault_kind, self.demo_fault_phase = None, "idle"
+        self.demo_rejected_frames = 0
+        self.demo_reset_reason = None
         self.is_demo_mode = port.startswith("DEMO")
         self.is_replay_mode = False
         self.requested_interval = 0.03
@@ -741,12 +1174,21 @@ class TelemetryDashboard(QMainWindow):
         if isinstance(worker, SerialWorker):
             worker.sequence_received.connect(self.observe_sequence)
             worker.health_received.connect(lambda health, source=worker: self.receive_firmware_health(source, health))
+            worker.fault_marker_received.connect(lambda marker, source=worker: self.on_live_fault_marker(source, marker))
+            worker.rejected_frame_received.connect(lambda line, source=worker: self.on_live_rejected_frame(source, line))
+            worker.accepted_frame_received.connect(lambda line, source=worker: self.on_live_accepted_frame(source, line))
+        elif isinstance(worker, DemoWorker):
+            worker.fault_event.connect(lambda event, source=worker: self.on_demo_fault_event(source, event))
+            worker.rejected_frame_received.connect(lambda line, source=worker: self.on_demo_rejected_frame(source, line))
+            worker.accepted_frame_received.connect(lambda line, source=worker: self.on_demo_accepted_frame(source, line))
         worker.finished.connect(lambda source=worker: self.source_finished(source))
         self.set_stream_controls(True)
         self.set_session_controls()
         self.btn_connect.setText("Disconnect")
         self.lbl_status.setText("CONNECTING")
         worker.start()
+        if self.fault_dialog is not None:
+            self.fault_dialog.refresh()
         QTimer.singleShot(500, lambda source=worker: self.send_command(
             next(key for key, button in self.rate_buttons.items() if button.isChecked()))
             if self.worker is source and not self.paused else None)
@@ -794,12 +1236,12 @@ class TelemetryDashboard(QMainWindow):
         self.set_session_controls()
         return True
 
-    def stop_recording(self):
+    def stop_recording(self, reason="user stopped recording"):
         recorder, self.session_recorder = self.session_recorder, None
         if recorder is None:
             return
         try:
-            manifest = recorder.close({"source_end_reason": "user stopped recording"})
+            manifest = recorder.close({"source_end_reason": reason})
             self.log_message(f"SYS >> RECORDING SAVED · {recorder.sample_count} SAMPLES · {manifest.name}")
         except OSError as error:
             self.log_message(f"WARN >> RECORDING FINALIZE FAILED · {error}")
@@ -862,6 +1304,10 @@ class TelemetryDashboard(QMainWindow):
     def set_replay_speed(self, index):
         speed = self.replay_speeds[index]
         self.lbl_replay_speed.setText(f"{speed:g}×")
+        if self.focus_overlay.controls is not None:
+            label = self.focus_overlay.controls.findChild(QLabel, "focusReplaySpeed")
+            if label is not None:
+                label.setText(self.lbl_replay_speed.text())
         if isinstance(self.worker, ReplayWorker):
             self.worker.set_speed(speed)
             self.update_replay_progress(self.replay_position_s, self.loaded_session.duration_s, force=True)
@@ -879,6 +1325,7 @@ class TelemetryDashboard(QMainWindow):
             self.paused = True
         self.worker.set_paused(self.paused)
         self.btn_play_replay.setText("Play  ▶" if self.paused else "Pause  ❚❚")
+        self.sync_focus_controls()
         self.log_message(f"SYS >> REPLAY {'PAUSED' if self.paused else 'PLAYING'}")
 
     def toggle_pause_shortcut(self):
@@ -946,6 +1393,9 @@ class TelemetryDashboard(QMainWindow):
         )
 
     def disconnect_source(self):
+        self.live_fault_kind = None
+        self.live_fault_phase = "idle"
+        self.live_fault_reconnect_port = None
         worker = self.worker
         if worker is None:
             return
@@ -959,6 +1409,14 @@ class TelemetryDashboard(QMainWindow):
     def source_finished(self, source):
         if self.worker is not source:
             return
+        reconnect_watchdog = (isinstance(source, SerialWorker) and source.running and
+                              self.live_fault_kind == "watchdog" and
+                              self.live_fault_phase in ("sent", "armed", "stalled", "recovering") and
+                              time.monotonic() - self.live_fault_started_at < 25.0)
+        if reconnect_watchdog:
+            self.live_fault_reconnect_port = source.port
+            self.live_fault_reboot_at = time.monotonic()
+            self.live_fault_detail = "COM port dropped during reset; reconnecting to verify boot reason."
         was_replay = self.is_replay_mode
         replay_completed = was_replay and source.next_index >= len(source.session.samples)
         self.worker = None
@@ -969,6 +1427,7 @@ class TelemetryDashboard(QMainWindow):
         self.paused = False
         self.is_replay_mode = False
         self.is_demo_mode = False
+        self.demo_fault_kind, self.demo_fault_phase = None, "idle"
         if self.session_recorder is not None:
             self.stop_recording()
         self.set_stream_controls(False)
@@ -982,12 +1441,39 @@ class TelemetryDashboard(QMainWindow):
                 f"Replay stopped at {self.replay_position_s:.2f} / {self.loaded_session.duration_s:.2f} s"
             )
         self.update_stats(time.monotonic())
+        if self.fault_dialog is not None:
+            self.fault_dialog.refresh()
+        if reconnect_watchdog:
+            QTimer.singleShot(750, self.reconnect_live_fault)
+
+    def reconnect_live_fault(self):
+        if self.worker is not None or self.live_fault_reconnect_port is None:
+            return
+        if time.monotonic() - self.live_fault_started_at >= 25.0:
+            self.live_fault_phase = "failed"
+            self.live_fault_detail = "COM port did not return in time; watchdog reset remains unverified."
+            return
+        port = self.live_fault_reconnect_port
+        self.refresh_ports()
+        index = self.port_combo.findText(port)
+        if index < 0:
+            QTimer.singleShot(750, self.reconnect_live_fault)
+            return
+        self.port_combo.setCurrentIndex(index)
+        self.live_fault_reconnecting = True
+        self.toggle_connection()
 
     def send_command(self, cmd):
         if self.is_replay_mode and cmd == 'p':
             self.toggle_replay_playback()
             return
         if self.worker is None or not self.worker.isRunning():
+            return
+        if cmd == 'p' and self.live_fault_phase in ("sent", "armed", "stalled", "contending", "recovering"):
+            self.log_message("SYS >> FINISH LIVE FAULT TEST BEFORE PAUSING TELEMETRY")
+            return
+        if cmd == 'p' and self.is_demo_mode and self.demo_fault_phase in ("active", "rebooting", "recovering"):
+            self.log_message("SYS >> FINISH FAULT RECOVERY BEFORE PAUSING DEMO TELEMETRY")
             return
         if cmd in ('p', 'f', 'n', 's') and self.calibration_wizard.stage in ("gyro", "faces", "ready"):
             self.calibration_wizard.cancel("Stream changed. Start calibration again when live data resumes.")
@@ -1018,6 +1504,28 @@ class TelemetryDashboard(QMainWindow):
         if self.worker is None or (self.paused and not allow_paused and not self.replay_step_in_flight):
             return
         now = time.monotonic()
+        if self.is_live_serial() and self.live_fault_kind == "watchdog":
+            previous_frame = self.live_fault_frame_times[-1] if self.live_fault_frame_times else None
+            if (self.live_fault_first_return_at is None and previous_frame is not None and
+                    now - previous_frame > .55):
+                self.live_fault_gap_start = previous_frame
+                self.live_fault_first_return_at = now
+                self.live_fault_gap_ms = (now - previous_frame) * 1000
+            elif self.live_fault_first_return_at is None and self.live_fault_phase in ("sent", "armed"):
+                self.live_fault_gap_start = now
+        if (self.is_live_serial() and self.live_fault_kind in ("mutex", "watchdog") and
+                now - self.live_fault_started_at < (3.0 if self.live_fault_kind == "mutex" else 25.0) and
+                len(self.live_fault_frame_times) < 600):
+            self.live_fault_frame_times.append(now)
+        if self.is_demo_mode and self.demo_fault_kind in ("mutex", "watchdog"):
+            if self.demo_fault_kind == "watchdog" and self.demo_fault_first_return_at is None:
+                previous_frame = self.demo_fault_frame_times[-1] if self.demo_fault_frame_times else None
+                if previous_frame is not None and now - previous_frame > .55:
+                    self.demo_fault_gap_start = previous_frame
+                    self.demo_fault_first_return_at = now
+                    self.demo_fault_gap_ms = (now - previous_frame) * 1000
+            if len(self.demo_fault_frame_times) < 600:
+                self.demo_fault_frame_times.append(now)
         if source_time_s is None:
             source_time_s = self.replay_position_s if self.is_replay_mode else now - self.session_started
         if self.is_live_serial():
@@ -1033,6 +1541,11 @@ class TelemetryDashboard(QMainWindow):
         for key, value in zip(('ax', 'ay', 'az', 'gx', 'gy', 'gz'), (ax, ay, az, gx, gy, gz)):
             self.data[key].append(value)
         self.plot_times.append(source_time_s)
+        cutoff = source_time_s - self.plot_window_s
+        while self.plot_times and self.plot_times[0] < cutoff:
+            self.plot_times.popleft()
+            for values in self.data.values():
+                values.popleft()
         sample = TelemetrySample(ax, ay, az, gx, gy, gz)
         self.latest_motion = self.estimator.update(sample, dt)
         self.pitch, self.roll, self.yaw = self.latest_motion.pitch, self.latest_motion.roll, self.latest_motion.yaw
@@ -1046,6 +1559,37 @@ class TelemetryDashboard(QMainWindow):
         self.peak_g = max(self.peak_g, self.latest_net_g)
         self.sample_timestamps.append(now)
         self.last_sample_at = now
+        if self.is_live_serial() and self.live_fault_phase == "recovering":
+            if self.live_fault_kind == "mutex" and self.live_fault_gap_start is not None:
+                gap_ms = (now - self.live_fault_gap_start) * 1000
+                self.live_fault_gap_ms = gap_ms
+                self.live_fault_detail = f"UART stream resumed after a measured {gap_ms:.0f} ms frame gap."
+            elif self.live_fault_kind == "checksum":
+                self.live_fault_detail += " Next valid COM3 frame accepted."
+            elif self.live_fault_kind == "watchdog":
+                self.live_fault_recovered_at = now
+                if self.live_fault_gap_ms is None and self.live_fault_gap_start is not None:
+                    self.live_fault_gap_ms = (now - self.live_fault_gap_start) * 1000
+                self.live_fault_detail = "IWDG reset confirmed; fresh sensor data is streaming again."
+            self.live_fault_phase = "recovered"
+            if self.fault_dialog is not None:
+                self.fault_dialog.record_event(self.live_fault_detail)
+                self.fault_dialog.refresh()
+        if self.is_demo_mode and self.demo_fault_phase == "recovering":
+            if self.demo_fault_kind == "mutex" and self.demo_fault_gap_start is not None:
+                self.demo_fault_gap_ms = (now - self.demo_fault_gap_start) * 1000
+                self.demo_fault_detail = f"Simulated UART stream resumed after a {self.demo_fault_gap_ms:.0f} ms packet gap."
+            elif self.demo_fault_kind == "checksum":
+                self.demo_fault_detail = "Changed packet rejected; next valid demo packet reached the graph."
+            elif self.demo_fault_kind == "watchdog":
+                self.demo_fault_detail = "Simulated IWDG reset confirmed; fresh demo packets are streaming."
+            self.demo_fault_recovered_at = now
+            self.demo_fault_phase = "recovered"
+            self.btn_pause.setEnabled(True)
+            self.log_message("SYS >> DEMO VALID TELEMETRY RESUMED · RECOVERY CONFIRMED")
+            if self.fault_dialog is not None:
+                self.fault_dialog.record_event(self.demo_fault_detail)
+                self.fault_dialog.refresh()
         if self.session_recorder is not None and record:
             try:
                 self.session_recorder.write(SessionSample(
@@ -1069,6 +1613,7 @@ class TelemetryDashboard(QMainWindow):
 
     def render_frame(self, force=False):
         now = time.monotonic()
+        self.update_live_fault(now)
         active = self.worker is not None and self.worker.isRunning() and not self.paused
         if self.latest_motion is not None and active:
             self.render_attitude_twin()
@@ -1082,6 +1627,8 @@ class TelemetryDashboard(QMainWindow):
             self.update_stats(now)
             if self.calibration_dialog is not None and self.calibration_dialog.isVisible():
                 self.calibration_dialog.refresh()
+            if self.fault_dialog is not None and self.fault_dialog.isVisible():
+                self.fault_dialog.refresh()
             self.last_stats_render = now
 
     def render_attitude_twin(self):
@@ -1114,6 +1661,13 @@ class TelemetryDashboard(QMainWindow):
         else:
             status, color = ("REPLAYING" if self.is_replay_mode else
                              ("DEMO CONNECTED" if self.is_demo_mode else "CONNECTED")), '#79d7a6'
+        if running and self.is_demo_mode and self.demo_fault_phase in ("active", "rebooting"):
+            if self.demo_fault_kind == "checksum":
+                status, color = "DEGRADED", '#ebc66d'
+            elif self.demo_fault_kind == "mutex":
+                status, color = "UART WAITING", '#ebc66d'
+            elif self.demo_fault_kind == "watchdog":
+                status, color = ("REBOOTING" if self.demo_fault_phase == "rebooting" else "TASK STALLED"), '#ebc66d'
         self.lbl_status.setText(status)
         self.lbl_status.setStyleSheet(f"color: {color}; font-weight: 600;")
         self.lbl_connection.setText(
@@ -1148,7 +1702,15 @@ class TelemetryDashboard(QMainWindow):
         age = now - self.last_sample_at if self.last_sample_at is not None else None
         self.lbl_health_last_frame.setText(f"{age * 1000:.0f} MS" if age is not None and running else "—")
         self.lbl_health_invalid.setText(str(getattr(self.worker, 'invalid_frames', 0)) if running else "0")
-        self.lbl_health_status.setText("NOMINAL" if running and fresh and not self.paused else status)
+        health_status = "NOMINAL" if running and fresh and not self.paused else status
+        if running and self.is_demo_mode and self.demo_fault_phase in ("active", "rebooting"):
+            if self.demo_fault_kind == "checksum":
+                health_status = "CHECKSUM FAULT"
+            elif self.demo_fault_kind == "mutex":
+                health_status = "UART MUTEX HELD"
+        elif running and self.is_demo_mode and self.demo_reset_reason:
+            health_status = "IWDG RESET (DEMO)"
+        self.lbl_health_status.setText(health_status)
 
     def set_terminal_filter(self, category, visible):
         if visible:
@@ -1241,6 +1803,8 @@ class TelemetryDashboard(QMainWindow):
 
     def closeEvent(self, event):
         self.focus_overlay.restore()
+        if self.fault_dialog is not None:
+            self.fault_dialog.close()
         if self.worker is not None:
             self.worker.stop()
             if not self.worker.wait(1500):
