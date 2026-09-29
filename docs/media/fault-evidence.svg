@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="455" viewBox="0 0 1400 455" role="img" aria-labelledby="title desc">
+  <title id="title">Fault injection and verification paths</title>
+  <desc id="desc">Three deliberate faults are shown with the evidence needed to verify them: checksum corruption leads to a rejected frame and next accepted frame; UART mutex contention produces a measured packet gap and resumed stream; watchdog starvation causes an IWDG reset and a fresh validated frame.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#101b29"/><stop offset="1" stop-color="#0b101a"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#8fc9d6" stroke-width="2"/></marker>
+    <style>text{font-family:Segoe UI,Arial,sans-serif;fill:#edf5f9}.top{font-size:13px;font-weight:700;letter-spacing:2px;fill:#79d3df}.title{font-size:28px;font-weight:700}.label{font-size:18px;font-weight:700}.body{font-size:16px;fill:#cbdde6}.card{fill:#172535;stroke:#405467;stroke-width:1.5}.num{font-size:14px;font-weight:700;fill:#8dd5dd}</style>
+  </defs>
+  <rect width="1400" height="455" rx="20" fill="url(#bg)"/>
+  <rect width="1400" height="8" rx="4" fill="#5cc8d7"/>
+  <text x="38" y="50" class="top">FAULT INJECTION</text>
+  <text x="38" y="88" class="title">Each failure ends with observable proof</text>
+
+  <rect class="card" x="39" y="121" width="1322" height="88" rx="13"/>
+  <rect x="39" y="121" width="7" height="88" rx="3" fill="#e5a976"/>
+  <text x="61" y="153" class="num">01 · INTEGRITY</text><text x="61" y="181" class="label">Bit flip + checksum</text>
+  <text x="373" y="154" class="body">Calculate CHK, then flip one payload bit</text>
+  <path d="M695 166 H741" stroke="#8fc9d6" stroke-width="2.5" marker-end="url(#arr)"/>
+  <text x="769" y="154" class="body">Host rejects changed frame</text>
+  <text x="769" y="181" class="body">Next valid sequence reaches graph</text>
+
+  <rect class="card" x="39" y="222" width="1322" height="88" rx="13"/>
+  <rect x="39" y="222" width="7" height="88" rx="3" fill="#6dd2df"/>
+  <text x="61" y="254" class="num">02 · CONTENTION</text><text x="61" y="282" class="label">UART mutex hold</text>
+  <text x="373" y="255" class="body">Status task holds shared UART lock</text>
+  <path d="M695 267 H741" stroke="#8fc9d6" stroke-width="2.5" marker-end="url(#arr)"/>
+  <text x="769" y="255" class="body">Measure hold and packet gap</text>
+  <text x="769" y="282" class="body">Validated packets resume</text>
+
+  <rect class="card" x="39" y="323" width="1322" height="88" rx="13"/>
+  <rect x="39" y="323" width="7" height="88" rx="3" fill="#84d6a4"/>
+  <text x="61" y="355" class="num">03 · RECOVERY</text><text x="61" y="383" class="label">Watchdog reset</text>
+  <text x="373" y="356" class="body">Stop feeding IWDG; MCU reboots</text>
+  <path d="M695 368 H741" stroke="#8fc9d6" stroke-width="2.5" marker-end="url(#arr)"/>
+  <text x="769" y="356" class="body">Confirm Reset: IWDG</text>
+  <text x="769" y="383" class="body">Observe fresh validated telemetry</text>
+  <text x="40" y="442" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="#a7bac7">Live mode uses board markers and arrivals. Demo mode labels all evidence as simulated.</text>
+</svg>

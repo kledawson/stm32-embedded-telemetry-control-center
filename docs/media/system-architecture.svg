@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="520" viewBox="0 0 1400 520" role="img" aria-labelledby="title desc">
+  <title id="title">STM32 Telemetry Console system architecture</title>
+  <desc id="desc">The MPU6050 sends measurements by I2C to an STM32F401RE. The board sends checksummed, sequenced telemetry over a USB serial link to a Python validator and desktop console. Demo data can enter the same parser; sessions and calibration profiles are stored on the PC. The app sends controls and one-shot fault commands back to the board.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#101b29"/><stop offset="1" stop-color="#0b101a"/></linearGradient>
+    <linearGradient id="cyan" x2="1"><stop stop-color="#55c5d8"/><stop offset="1" stop-color="#7be0d0"/></linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#76cdda" stroke-width="2"/></marker>
+    <marker id="return" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#f0be72" stroke-width="2"/></marker>
+    <style>
+      text{font-family:Segoe UI,Arial,sans-serif;fill:#edf5f9} .eyebrow{font-size:13px;font-weight:700;letter-spacing:2px;fill:#73cddd} .title{font-size:29px;font-weight:700} .card{fill:#162434;stroke:#3a5365;stroke-width:2} .small{font-size:15px;fill:#aec2d0} .name{font-size:22px;font-weight:700} .detail{font-size:16px;fill:#d6e6ed} .edge{font-size:14px;font-weight:700;fill:#8bd5df} .pill{fill:#1d3644;stroke:#3e7d8e;stroke-width:1.5} .ptext{font-size:14px;font-weight:700;fill:#a9e7ee}
+    </style>
+  </defs>
+  <rect width="1400" height="520" rx="20" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1400" height="8" rx="4" fill="url(#cyan)"/>
+  <text x="38" y="52" class="eyebrow">END-TO-END DESIGN</text>
+  <text x="38" y="91" class="title">From motion to a validated, explainable stream</text>
+
+  <rect class="card" x="38" y="155" width="215" height="205" rx="15"/>
+  <text x="59" y="193" class="eyebrow">SENSE</text>
+  <text x="59" y="232" class="name">MPU6050</text>
+  <text x="59" y="270" class="detail">Acceleration + gyro</text>
+  <text x="59" y="298" class="small">14-byte burst read</text>
+  <text x="59" y="326" class="small">200 Hz configuration</text>
+
+  <rect class="card" x="297" y="155" width="290" height="205" rx="15"/>
+  <text x="319" y="193" class="eyebrow">ACQUIRE + CONTROL</text>
+  <text x="319" y="232" class="name">STM32F401RE</text>
+  <text x="319" y="270" class="detail">FreeRTOS telemetry task</text>
+  <text x="319" y="298" class="small">Status task · UART DMA</text>
+  <text x="319" y="326" class="small">Watchdog · Flash snapshot</text>
+
+  <rect class="card" x="631" y="155" width="173" height="205" rx="15"/>
+  <text x="652" y="193" class="eyebrow">TRANSPORT</text>
+  <text x="652" y="232" class="name">USB serial</text>
+  <text x="652" y="270" class="detail">115200 baud</text>
+  <text x="652" y="298" class="small">SEQ + XOR CHK</text>
+  <text x="652" y="326" class="small">30 ms stream</text>
+
+  <rect class="card" x="847" y="155" width="230" height="205" rx="15"/>
+  <text x="869" y="193" class="eyebrow">VALIDATE</text>
+  <text x="869" y="232" class="name">Python parser</text>
+  <text x="869" y="270" class="detail">Reject bad checksums</text>
+  <text x="869" y="298" class="small">Track gaps + health</text>
+  <text x="869" y="326" class="small">Correct / derive motion</text>
+
+  <rect class="card" x="1121" y="155" width="241" height="205" rx="15"/>
+  <text x="1143" y="193" class="eyebrow">EXPLORE</text>
+  <text x="1143" y="232" class="name">Desktop console</text>
+  <text x="1143" y="270" class="detail">Plots + 3D attitude</text>
+  <text x="1143" y="298" class="small">Health + fault evidence</text>
+  <text x="1143" y="326" class="small">Record / replay</text>
+
+  <path d="M254 257 H290" stroke="#76cdda" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M588 257 H624" stroke="#76cdda" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M805 257 H840" stroke="#76cdda" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M1078 257 H1114" stroke="#76cdda" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="260" y="140" class="edge">I²C1</text>
+  <text x="582" y="140" class="edge">USART2</text>
+
+  <path d="M962 366 V408 H442 V366" fill="none" stroke="#e6ad69" stroke-width="2.5" marker-end="url(#return)"/>
+  <text x="535" y="398" font-family="Segoe UI,Arial,sans-serif" font-size="15" font-weight="700" fill="#f0be72">Commands: rate, pause, fault injection</text>
+
+  <rect class="pill" x="38" y="441" width="252" height="45" rx="11"/>
+  <text class="ptext" x="59" y="470">DemoWorker → same parser</text>
+  <path d="M290 464 H830 V353" fill="none" stroke="#77d2d0" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#arrow)"/>
+  <rect class="pill" x="960" y="441" width="402" height="45" rx="11"/>
+  <text class="ptext" x="984" y="470">On PC: calibration profiles · CSV + JSON sessions</text>
+</svg>

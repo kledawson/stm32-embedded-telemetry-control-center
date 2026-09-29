@@ -1,19 +1,14 @@
 # STM32 Telemetry Console
 
-A desktop view for an STM32F401RE and MPU6050 motion sensor. The STM32 reads the sensor and streams data over USB serial; the Python app plots it, rotates a 3D model, and can record and replay a session.
+An end-to-end motion telemetry project for the **Nucleo STM32F401RE** and **MPU6050**. FreeRTOS firmware streams checksummed sensor data to a Python console for plots, 3D attitude, recording, and fault diagnosis. **Demo mode runs without hardware.**
 
-## What it does
+![Desktop dashboard connected to the live sensor on COM3](docs/media/dashboard-live.png)
 
-- Shows the latest 30 seconds of acceleration and rotation, motion events, and a 3D aircraft. Demo mode works without hardware.
-- Records sessions to CSV with a JSON manifest, then replays them with seek, step, and speed controls.
-- Guides gyro and six-face accelerometer calibration. Profiles are saved on the PC for each board.
-- Demonstrates a one-bit checksum failure, UART mutex contention, and a watchdog reset on the real board or through a hardware-free simulation.
-- Shows connection health: checksum errors, packet loss, timing, throughput, reset cause, and FreeRTOS stack margin.
-- Runs STM32 firmware with FreeRTOS tasks, DMA UART output, a watchdog, and a Flash crash snapshot.
+*Live COM3 telemetry during board movement: 30-second plots, 3D attitude, and motion events.*
 
-## Run the app
+## Try the demo
 
-Use Python 3.10 or newer on Windows:
+On Windows with Python 3.10 or newer:
 
 ```powershell
 py -m venv .venv
@@ -22,39 +17,62 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-Choose **DEMO — No Hardware** and **Connect** to explore the dashboard. For live data, build and flash the [firmware](firmware/README.md), connect the Nucleo board, select its COM port, and connect. The app requests the 30 ms visual stream rate.
+Select **DEMO — No Hardware → Connect**. Open **Fault Injection** and run **Bit flip + checksum** to see a bad packet rejected and the next valid one accepted. UART contention and watchdog recovery are also available. Simulated evidence is labeled **Demo**.
 
-## Main workflows
+## Connect a real board
 
-**Calibrate:** With live telemetry running and recording stopped, select **Calibrate → Start calibration**. Hold the board comfortably and pause its rotation briefly for the gyro check. Then hold each of its six faces upward until its tile fills. Small hand tremors are okay. Select **Save profile** after all six faces pass. Calibration is applied in the app, not written to the STM32.
+You need a Nucleo STM32F401RE, an MPU6050 breakout, jumper wires, and a USB connection for ST-LINK. The firmware expects I²C address **0x68** (`AD0` low). Check your breakout's voltage requirements before wiring:
 
-**Record and replay:** Select **Start recording**, choose a CSV path, then **Stop & save recording**. The matching JSON manifest is saved beside it. Disconnect, choose **Open session for replay…**, and use Play/Pause, the timeline, single-frame step, and the snapping speed slider. Replay uses the recorded corrected samples without applying calibration again.
+| MPU6050 | STM32F401RE |
+| --- | --- |
+| SDA | PB9 / I²C1 SDA |
+| SCL | PB8 / I²C1 SCL |
+| GND | GND |
+| VCC | 3.3 V, if supported by the breakout |
+| AD0 | GND for address 0x68 |
 
-**Check health:** Open **Calibrate** to see checksum errors, packet loss, jitter, and throughput. Expand **Technical details** for reset cause, task stack margin, command drops, and the board ID. Older firmware can still stream data but may not provide every health field.
+Open [`firmware/MPU6050_FreeRTOS.ioc`](firmware/MPU6050_FreeRTOS.ioc) in STM32CubeIDE, build, and flash through ST-LINK. Connect the board's USB serial port, run `python app.py`, select its **COM** port, and click **Connect**. The app requests a 30 ms stream interval. See [firmware build notes](firmware/README.md).
 
-**Demonstrate failures:** With the updated firmware flashed, connect the board and open **Fault Injection** beside Calibrate. **Bit flip + checksum** changes one outgoing sensor frame on the board after its checksum was calculated. An animated packet flow shows the original value and checksum, the bit changed on UART, the host's rejection, and the next accepted frame. **UART mutex contention** briefly holds the shared UART lock. Its millisecond timeline draws live COM3 arrivals and the growing hold once, then freezes the captured result. Large readouts show the measured packet gap and mutex hold duration. **Watchdog reset** shows the telemetry task, hardware watchdog, and MCU transition, plus a packet-arrival timeline retained across COM reconnection. After recovery, the timeline compresses the real silence interval with an explicit axis break so validated packets on either side are visible at millisecond scale. The app confirms `Reset: IWDG` and fresh telemetry before reporting recovery. Display pacing never delays COM3 telemetry. Each test is one shot. If the expected firmware response does not arrive, the window reports the test as unconfirmed. The watchdog test closes an active recording before the reset. The window opens as large as useful without exceeding the current monitor's available space.
+## Explore the console
 
-For a hardware-free walkthrough, connect **DEMO — No Hardware** and open the same Fault Injection window. Its three tests use the same packet, mutex timeline, and watchdog visuals as COM3. Demo packets pass through the parser; the one-bit change fails checksum validation, the mutex briefly interrupts packets, and the watchdog stops and restarts the simulated stream. Each run uses slightly varied sensor values and timing, and the window labels all simulated evidence as Demo.
+| Workflow | In the app |
+| --- | --- |
+| Live motion | 30-second plots, motion events, connection health, and a 3D aircraft. |
+| Capture and replay | **Start recording → Stop & save recording** writes CSV plus JSON. Use **Open session for replay…** to seek, step, and change speed. |
+| Calibrate | With live data and recording stopped, open **Calibrate → Start calibration** for gyro and six-face checks; save a PC profile. |
+| Diagnose | Open **Calibrate** for link and firmware health. Open **Fault Injection** for one-shot faults. |
 
-The live shortcuts are **V/F/N/S** for stream rates, **P** for pause, **R** to zero the orientation estimate, and **D** to dump the Flash snapshot. **C** erases and re-arms the crash log in Flash Sector 5. **Escape** closes an expanded plot or 3D view.
+![Calibration progress and live device health on COM3](docs/media/diagnostics-live.png)
 
-## Test and navigate the code
+*Live calibration and health: two faces completed; 2,167 validated frames, 0 checksum errors, and 0 missing sequence numbers. “Needs attention” reflects the board's previous IWDG reset.*
+
+## System design
+
+![Architecture from MPU6050 through STM32 and USB serial to the desktop console](docs/media/system-architecture.svg)
+
+- **Firmware:** synchronized 14-byte I²C reads, FreeRTOS telemetry and status tasks, DMA UART, watchdog, and Flash crash snapshot.
+- **Protocol:** sequence numbers and an 8-bit XOR checksum let the host reject bad frames and measure gaps.
+- **Desktop:** serial, demo, and replay sources feed the same console. PC calibration and validated recordings keep replay consistent.
+
+![Three deliberate fault paths and the evidence used to verify recovery](docs/media/fault-evidence.svg)
+
+On hardware, the three faults corrupt one frame, hold the UART lock, or stop IWDG refresh. The app waits for packet, timing, or boot evidence before reporting success. Demo mode runs labeled simulations through the host parser.
+
+![Live COM3 watchdog fault showing verified reboot and restored telemetry](docs/media/fault-watchdog-live.png)
+
+*Live watchdog demonstration: the board reports `Reset: IWDG`, then fresh validated telemetry resumes after a measured 4.1 s packet gap.*
+
+## Verify and navigate
 
 ```powershell
 python -m unittest discover -s tests -v
 python tests/smoke_dashboard.py
 ```
 
-The first command runs hardware-free unit tests. The second opens the desktop app and needs its UI dependencies and OpenGL context. With a board connected and its port free, `python tests/live_serial_smoke.py COM3 --seconds 7 --gyro-check` checks the serial stream; `python tests/live_dashboard_smoke.py COM3` checks the live UI. `python tests/live_fault_smoke.py COM3` verifies the three firmware faults and intentionally resets the board once. `python tests/live_fault_dashboard_smoke.py COM3` exercises them through the desktop window. Replace `COM3` with your port.
+The first command runs hardware-free tests; the second needs a desktop/OpenGL context. Connected-board checks are in `tests/live_*_smoke.py`.
 
-- `app.py`: main window and controls
-- `sources.py`: serial, demo, and replay workers
-- `models.py`: built-in 3D models and STL loading
-- `telemetry.py`, `kinematics.py`, `motion_events.py`: parsing and sensor processing
-- `calibration.py`, `calibration_ui.py`, `session_io.py`: calibration and saved sessions
-- `fault_ui.py`: modeless live and demo fault window; `sources.py` handles real serial evidence and simulated faults
-- `firmware/`: STM32CubeIDE project and [firmware build notes](firmware/README.md)
+Code map: [`firmware/`](firmware/) handles acquisition; [`app.py`](app.py), [`sources.py`](sources.py), and [`fault_ui.py`](fault_ui.py) handle the console and sources; [`telemetry.py`](telemetry.py), [`kinematics.py`](kinematics.py), and [`motion_events.py`](motion_events.py) process data; [`session_io.py`](session_io.py) and [`calibration.py`](calibration.py) manage saved state.
 
-The motion labels are demonstration heuristics, not safety measurements. An MPU6050 estimates attitude and linear acceleration, but it cannot provide drift-free position or absolute yaw.
+Shortcuts: **V/F/N/S** change stream rate, **P** pauses, **R** zeros orientation, **D** dumps the Flash snapshot, **C** erases and re-arms the crash log, and **Esc** closes an expanded view.
 
-MIT licensed. See [LICENSE](LICENSE).
+Motion labels are demonstration heuristics, not safety measurements. The MPU6050 cannot provide drift-free position or absolute yaw. MIT licensed; see [LICENSE](LICENSE).
