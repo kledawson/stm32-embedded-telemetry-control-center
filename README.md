@@ -6,18 +6,36 @@ An end-to-end motion telemetry project for the **Nucleo STM32F401RE** and **MPU6
 
 *Live COM3 telemetry during board movement: 30-second plots, 3D attitude, and motion events.*
 
-## Try the demo
+## Download and set up
 
-On Windows with Python 3.10 or newer:
+Install Python 3.10 or newer. Clone the repository, or use **Code → Download ZIP** on GitHub and extract the complete archive. Keep the folder structure below intact, then open PowerShell in the repository root (the folder containing `app.py`):
 
 ```powershell
+git clone https://github.com/kledawson/stm32-embedded-telemetry-control-center.git
+cd stm32-embedded-telemetry-control-center
 py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python app.py
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe app.py
 ```
 
-Select **DEMO — No Hardware → Connect**. Open **Fault Injection** and run **Bit flip + checksum** to see a bad packet rejected and the next valid one accepted. UART contention and watchdog recovery are also available. Simulated evidence is labeled **Demo**.
+For the ZIP option, skip the `git clone` and `cd` lines; open PowerShell in the extracted project folder and run the remaining commands. The `.venv` folder is created locally for Python dependencies.
+
+To update a Git clone later, run `git pull origin main` from the repository root. For a ZIP install, download and extract the latest ZIP again.
+
+```text
+project-root/                              ← run app.py from this folder
+├── app.py                                 ← desktop app entry point
+├── calibration.py, *_ui.py, ...           ← Python modules imported by app.py
+├── requirements.txt                       ← Python packages
+├── firmware/                              ← .ioc project, Core, Drivers, Middleware
+├── docs/media/                            ← README screenshots and diagrams
+├── tests/                                 ← unit and hardware smoke checks
+└── .venv/                                 ← created on your computer by setup
+```
+
+## Try the demo
+
+Select **DEMO — No Hardware → Connect**. No board is required. Open **Fault Injection** and run **Bit flip + checksum** to see a bad packet rejected and the next valid one accepted. UART contention and watchdog recovery are also available. Simulated evidence is labeled **Demo**.
 
 ## Connect a real board
 
