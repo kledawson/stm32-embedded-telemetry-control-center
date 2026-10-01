@@ -7,16 +7,17 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QComboBox, QTextEdit, 
                              QGridLayout, QSplitter, QLabel, QFrame,
                              QFileDialog, QMessageBox, QToolButton, QSlider)
-from PyQt6.QtCore import Qt, QTimer, QEvent
-from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtCore import Qt, QTimer, QEvent, QSize
+from PyQt6.QtGui import QKeySequence, QShortcut, QIcon, QPixmap, QPainter, QColor
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
 from kinematics import AttitudeEstimator
-from dashboard_ui import STYLE, Panel, CollapsibleSection, FocusOverlay, RailScrollArea, fit_window_to_screen
+from dashboard_ui import STYLE, Panel, CollapsibleSection, FocusOverlay, FloatingChartControls, RailScrollArea, fit_window_to_screen
 from motion_events import MotionEvents
 from telemetry import TelemetrySample, calculate_checksum, parse_telemetry_line
 from session_io import Session, SessionRecorder, SessionSample, load_session
+from session_ui import SessionImportDialog
 from calibration import CalibrationWizard, load_profile, save_profile
 from calibration_ui import CalibrationDialog
 from fault_ui import FaultLabDialog
@@ -248,16 +249,30 @@ class TelemetryDashboard(QMainWindow):
         session_controls = section_layout("SESSION CAPTURE + REPLAY", True)
         self.btn_record = QPushButton("Start recording")
         self.btn_record.setObjectName("primary")
-        self.btn_record.setToolTip("Record validated live or demo telemetry to a CSV/JSON session pair.")
+        self.btn_record.setToolTip("Record validated telemetry to one ZIP containing its CSV and JSON manifest.")
         self.btn_record.clicked.connect(self.toggle_recording)
         session_controls.addWidget(self.btn_record)
+        self.lbl_recording_status = self.label('', 'muted')
+        self.lbl_recording_status.setStyleSheet('color: #ebc66d; font-size: 11px;')
+        self.lbl_recording_status.setWordWrap(True)
+        self.lbl_recording_status.hide()
+        session_controls.addWidget(self.lbl_recording_status)
         self.btn_open_session = QPushButton("Open session for replay…")
-        self.btn_open_session.setToolTip("Load a saved CSV or JSON session without connecting hardware.")
+        self.btn_open_session.setToolTip("Open a session ZIP, or select its CSV and JSON together, without hardware.")
         self.btn_open_session.clicked.connect(self.open_session)
         session_controls.addWidget(self.btn_open_session)
         playback_row = QHBoxLayout()
         playback_row.setSpacing(5)
         self.btn_play_replay = QPushButton("Play  ▶")
+        self.btn_play_replay.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        pause_pixmap = QPixmap(10, 10)
+        pause_pixmap.fill(Qt.GlobalColor.transparent)
+        pause_painter = QPainter(pause_pixmap)
+        pause_painter.fillRect(2, 3, 2, 6, QColor('#edf3fa'))
+        pause_painter.fillRect(6, 3, 2, 6, QColor('#edf3fa'))
+        pause_painter.end()
+        self.replay_pause_icon = QIcon(pause_pixmap)
+        self.btn_play_replay.setIconSize(QSize(10, 10))
         self.btn_play_replay.setObjectName("primary")
         self.btn_play_replay.setEnabled(False)
         self.btn_play_replay.setToolTip("Play or pause this recording (P).")
@@ -308,7 +323,7 @@ class TelemetryDashboard(QMainWindow):
         self.btn_step.setToolTip("Pause replay and advance one recorded sample.")
         self.btn_step.clicked.connect(self.step_replay)
         session_controls.addWidget(self.btn_step)
-        attitude_controls = section_layout("3D ATTITUDE")
+        attitude_controls = section_layout("3D SIMULATION")
         self.model_combo = QComboBox()
         self.model_combo.addItems(["Jet Aircraft", "Orbital Satellite", "Quadcopter Drone", "Load Custom STL…"])
         self.model_combo.setCurrentIndex(0)
@@ -421,7 +436,7 @@ class TelemetryDashboard(QMainWindow):
         self.lbl_angles.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_angles.setToolTip("Drag gently to orbit · Ctrl+drag to pan · wheel to zoom. Cyan vector: estimated linear acceleration.")
         model_layout.addWidget(self.lbl_angles)
-        self.model_panel = Panel("3D Attitude", model_body, self.expand_panel)
+        self.model_panel = Panel("3D Simulation", model_body, self.expand_panel)
         hero.addWidget(self.model_panel)
 
         event_body = QWidget()
@@ -570,78 +585,131 @@ class TelemetryDashboard(QMainWindow):
             button.setChecked(source.isChecked())
             source.toggled.connect(button.setChecked)
         button.setEnabled(source.isEnabled())
+        button.setIcon(source.icon())
+        button.setIconSize(source.iconSize())
+        button.setLayoutDirection(source.layoutDirection())
         button.clicked.connect(source.click)
         return button
 
     def make_focus_controls(self, panel):
-        controls = QFrame()
-        controls.setObjectName("focusControls")
-        box = QVBoxLayout(controls)
-        box.setContentsMargins(10, 8, 10, 8)
-        box.setSpacing(6)
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        box.addLayout(row)
-
         if panel is self.model_panel:
-            row.addWidget(self.label("MODEL", "section"))
-            picker = QComboBox()
-            picker.setObjectName("focusModelPicker")
-            picker.addItems(self.model_combo.itemText(index) for index in range(self.model_combo.count()))
-            picker.setCurrentIndex(self.model_combo.currentIndex())
-            picker.currentIndexChanged.connect(self.model_combo.setCurrentIndex)
-            self.model_combo.currentIndexChanged.connect(picker.setCurrentIndex)
-            row.addWidget(picker)
-            row.addWidget(self.linked_focus_button("Reset attitude  [R]", self.btn_reset_yaw, "focusReset"))
-            row.addStretch()
-        elif panel in (self.accel_panel, self.gyro_panel):
-            if self.is_replay_mode:
-                row.addWidget(self.label("REPLAY", "section"))
-                row.addWidget(self.linked_focus_button(self.btn_play_replay.text(),
-                                                       self.btn_play_replay, "focusReplayPlay"))
-                row.addWidget(self.label("SPEED", "section"))
-                slider = QSlider(Qt.Orientation.Horizontal)
-                slider.setObjectName("focusReplaySpeedSlider")
-                slider.setRange(0, len(self.replay_speeds) - 1)
-                slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-                slider.setTickInterval(1)
-                slider.setValue(self.replay_speed_slider.value())
-                slider.valueChanged.connect(self.replay_speed_slider.setValue)
-                self.replay_speed_slider.valueChanged.connect(slider.setValue)
-                row.addWidget(slider, 1)
-                speed = self.label(self.lbl_replay_speed.text(), "healthValue")
-                speed.setObjectName("focusReplaySpeed")
-                row.addWidget(speed)
-            else:
-                row.addWidget(self.label("STREAM RATE", "section"))
-                for key, title in (("v", "33 Hz"), ("f", "2 Hz"), ("n", "1 Hz"), ("s", "0.5 Hz")):
-                    row.addWidget(self.linked_focus_button(title, self.rate_buttons[key], f"focusRate_{key}"))
-                row.addStretch()
-        elif panel is self.terminal_panel:
-            row.addWidget(self.label("SHOW", "section"))
-            for category in ("SYS", "TEL", "EVT", "WARN"):
-                row.addWidget(self.linked_focus_button(category, self.terminal_filter_buttons[category],
-                                                       f"focusTerminal_{category}"))
-            row.addStretch()
-            output_row = QHBoxLayout()
-            output_row.setSpacing(6)
-            output_row.addWidget(self.linked_focus_button("Timestamps", self.btn_timestamps, "focusTimestamps"))
-            output_row.addWidget(self.linked_focus_button("Health", self.btn_health, "focusHealth"))
-            output_row.addSpacing(8)
-            output_row.addWidget(self.label("OUTPUT RATE", "section"))
-            output_picker = QComboBox()
-            output_picker.setObjectName("focusTerminalRate")
-            output_picker.addItems(label for _, label in self.terminal_rate_options)
-            output_picker.setCurrentIndex(self.terminal_rate_slider.value())
-            output_picker.currentIndexChanged.connect(self.terminal_rate_slider.setValue)
-            self.terminal_rate_slider.valueChanged.connect(output_picker.setCurrentIndex)
-            output_row.addWidget(output_picker)
-            output_row.addWidget(self.linked_focus_button("Follow live", self.btn_resume_terminal,
-                                                          "focusFollowLive"))
-            output_row.addStretch()
-            box.addLayout(output_row)
-        else:
-            return None
+            return self.make_simulation_controls()
+        if panel in (self.accel_panel, self.gyro_panel):
+            return self.make_chart_controls()
+        if panel is self.terminal_panel:
+            return self.make_terminal_controls()
+        return None
+
+    def make_terminal_controls(self):
+        controls = FloatingChartControls('Terminal controls')
+        controls.anchor_widget = self.terminal.viewport()
+        box = controls.body_layout
+        box.addWidget(self.label('SHOW MESSAGES', 'section'))
+        filters = QGridLayout()
+        filters.setSpacing(6)
+        for index, category in enumerate(('SYS', 'TEL', 'EVT', 'WARN')):
+            filters.addWidget(self.linked_focus_button(category, self.terminal_filter_buttons[category],
+                                                       f'focusTerminal_{category}'), 0, index)
+        box.addLayout(filters)
+        toggles = QHBoxLayout()
+        toggles.setSpacing(6)
+        toggles.addWidget(self.linked_focus_button('Timestamps', self.btn_timestamps, 'focusTimestamps'), 1)
+        toggles.addWidget(self.linked_focus_button('Health', self.btn_health, 'focusHealth'), 1)
+        box.addLayout(toggles)
+        rate_row = QHBoxLayout()
+        rate_row.addWidget(self.label('OUTPUT RATE', 'section'))
+        rate_row.addStretch()
+        output_picker = QComboBox()
+        output_picker.setObjectName('focusTerminalRate')
+        output_picker.setAccessibleName('Terminal output rate')
+        output_picker.addItems(label for _, label in self.terminal_rate_options)
+        output_picker.setCurrentIndex(self.terminal_rate_slider.value())
+        output_picker.currentIndexChanged.connect(self.terminal_rate_slider.setValue)
+        self.terminal_rate_slider.valueChanged.connect(output_picker.setCurrentIndex)
+        rate_row.addWidget(output_picker)
+        box.addLayout(rate_row)
+        box.addWidget(self.linked_focus_button('Follow live', self.btn_resume_terminal, 'focusFollowLive'))
+        return controls
+
+    def make_simulation_controls(self):
+        controls = FloatingChartControls('Simulation controls')
+        controls.anchor_widget = self.view_3d
+        box = controls.body_layout
+        box.addWidget(self.label('3D MODEL', 'section'))
+        picker = QComboBox()
+        picker.setObjectName('focusModelPicker')
+        picker.setAccessibleName('Simulation model')
+        picker.addItems(self.model_combo.itemText(index) for index in range(self.model_combo.count()))
+        picker.setCurrentIndex(self.model_combo.currentIndex())
+        picker.currentIndexChanged.connect(self.model_combo.setCurrentIndex)
+        self.model_combo.currentIndexChanged.connect(picker.setCurrentIndex)
+        box.addWidget(picker)
+        box.addWidget(self.linked_focus_button('Reset attitude  [R]', self.btn_reset_yaw, 'focusReset'))
+        return controls
+
+    def make_chart_controls(self):
+        controls = FloatingChartControls()
+        box = controls.body_layout
+        if not self.is_replay_mode:
+            box.addWidget(self.label('STREAM RATE', 'section'))
+            rates = QGridLayout()
+            rates.setSpacing(8)
+            for index, (key, title) in enumerate((('v', '33 Hz'), ('f', '2 Hz'), ('n', '1 Hz'), ('s', '0.5 Hz'))):
+                rates.addWidget(self.linked_focus_button(title, self.rate_buttons[key], f'focusRate_{key}'), index // 2, index % 2)
+            box.addLayout(rates)
+            return controls
+        box.addWidget(self.label('SESSION REPLAY', 'section'))
+        name = self.label(self.loaded_session.path.name if self.loaded_session else 'Recorded session', 'muted')
+        name.setWordWrap(True)
+        box.addWidget(name)
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        for title, source, object_name in (
+                (self.btn_play_replay.text(), self.btn_play_replay, 'focusReplayPlay'),
+                ('Restart ↺', self.btn_restart_replay, 'focusReplayRestart'),
+                ('Step ▸|', self.btn_step, 'focusReplayStep')):
+            button = self.linked_focus_button(title, source, object_name)
+            button.setMinimumWidth(0)
+            button.setToolTip(source.toolTip() or title)
+            actions.addWidget(button, 1)
+        box.addLayout(actions)
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(self.label('Playback speed', 'muted'))
+        speed_row.addStretch()
+        speed = QComboBox()
+        speed.setObjectName('focusReplaySpeedPicker')
+        speed.setAccessibleName('Chart replay speed')
+        speed.addItems(f'{value:g}×' for value in self.replay_speeds)
+        speed.setCurrentIndex(self.replay_speed_slider.value())
+        speed.currentIndexChanged.connect(self.replay_speed_slider.setValue)
+        self.replay_speed_slider.valueChanged.connect(speed.setCurrentIndex)
+        speed_row.addWidget(speed)
+        box.addLayout(speed_row)
+        divider = QFrame()
+        divider.setObjectName('chartControlDivider')
+        divider.setFixedHeight(1)
+        box.addWidget(divider)
+        timeline = QHBoxLayout()
+        status = self.label('Playing', 'healthValue')
+        status.setObjectName('focusReplayState')
+        timeline.addWidget(status)
+        timeline.addStretch()
+        time_label = self.label('', 'muted')
+        time_label.setObjectName('focusReplayTime')
+        timeline.addWidget(time_label)
+        box.addLayout(timeline)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setObjectName('focusReplayPosition')
+        slider.setAccessibleName('Chart replay position')
+        slider.setRange(self.replay_slider.minimum(), self.replay_slider.maximum())
+        slider.setValue(self.replay_slider.value())
+        slider.valueChanged.connect(self.replay_slider.setValue)
+        self.replay_slider.valueChanged.connect(slider.setValue)
+        slider.sliderPressed.connect(self.begin_replay_seek)
+        slider.sliderMoved.connect(self.preview_replay_seek)
+        slider.sliderReleased.connect(self.commit_replay_seek)
+        slider.installEventFilter(self)
+        box.addWidget(slider)
         return controls
 
     def sync_focus_controls(self):
@@ -656,10 +724,34 @@ class TelemetryDashboard(QMainWindow):
         play = controls.findChild(QPushButton, "focusReplayPlay")
         if play is not None:
             play.setText(self.btn_play_replay.text())
+            play.setIcon(self.btn_play_replay.icon())
             play.setEnabled(self.btn_play_replay.isEnabled())
         speed = controls.findChild(QSlider, "focusReplaySpeedSlider")
         if speed is not None:
             speed.setEnabled(self.replay_speed_slider.isEnabled())
+        for name, source in (('focusReplayRestart', self.btn_restart_replay), ('focusReplayStep', self.btn_step)):
+            button = controls.findChild(QPushButton, name)
+            if button is not None:
+                button.setEnabled(source.isEnabled())
+        picker = controls.findChild(QComboBox, 'focusReplaySpeedPicker')
+        if picker is not None:
+            picker.setEnabled(self.replay_speed_slider.isEnabled())
+        position = controls.findChild(QSlider, 'focusReplayPosition')
+        if position is not None:
+            position.setEnabled(self.replay_slider.isEnabled())
+        status = controls.findChild(QLabel, 'focusReplayState')
+        if status is not None:
+            status.setText('Paused' if self.paused else 'Playing' if self.is_replay_mode else 'Offline')
+            status.setStyleSheet('color: #ebc66d;' if self.paused else 'color: #86d8a6;')
+        self.sync_chart_replay_time()
+
+    def sync_chart_replay_time(self, preview=None):
+        if not hasattr(self, 'focus_overlay') or self.focus_overlay.controls is None:
+            return
+        label = self.focus_overlay.controls.findChild(QLabel, 'focusReplayTime')
+        if label is not None and self.loaded_session is not None:
+            position = self.replay_position_s if preview is None else preview
+            label.setText(f'{position:.2f} s / {self.loaded_session.duration_s:.2f} s')
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -669,6 +761,24 @@ class TelemetryDashboard(QMainWindow):
             self.position_resume_terminal_button()
 
     def eventFilter(self, watched, event):
+        if watched.objectName() == 'focusReplayPosition' and watched.isEnabled():
+            actions = {Qt.Key.Key_Left: QSlider.SliderAction.SliderSingleStepSub,
+                       Qt.Key.Key_Down: QSlider.SliderAction.SliderSingleStepSub,
+                       Qt.Key.Key_Right: QSlider.SliderAction.SliderSingleStepAdd,
+                       Qt.Key.Key_Up: QSlider.SliderAction.SliderSingleStepAdd,
+                       Qt.Key.Key_PageDown: QSlider.SliderAction.SliderPageStepSub,
+                       Qt.Key.Key_PageUp: QSlider.SliderAction.SliderPageStepAdd,
+                       Qt.Key.Key_Home: QSlider.SliderAction.SliderToMinimum,
+                       Qt.Key.Key_End: QSlider.SliderAction.SliderToMaximum}
+            action = actions.get(event.key()) if event.type() == QEvent.Type.KeyPress else None
+            if event.type() == QEvent.Type.Wheel:
+                action = QSlider.SliderAction.SliderSingleStepAdd if event.angleDelta().y() > 0 else QSlider.SliderAction.SliderSingleStepSub
+            if action is not None:
+                self.begin_replay_seek()
+                watched.triggerAction(action)
+                self.preview_replay_seek(watched.value())
+                self.commit_replay_seek()
+                return True
         if hasattr(self, 'terminal') and watched is self.terminal.viewport() and event.type() == QEvent.Type.Resize:
             self.position_resume_terminal_button()
         return super().eventFilter(watched, event)
@@ -691,16 +801,27 @@ class TelemetryDashboard(QMainWindow):
         live_source = active and not self.is_replay_mode
         recording = self.session_recorder is not None
         self.btn_record.setEnabled(live_source)
-        self.btn_record.setText("Stop & save recording" if recording else "Start recording")
-        self.btn_open_session.setEnabled(not active)
+        self.btn_record.setText("Stop && Save Recording" if recording else "Start Recording")
+        self.btn_open_session.setEnabled(not recording)
         self.btn_restart_replay.setEnabled(self.loaded_session is not None and (not active or self.is_replay_mode))
         replay_active = active and self.is_replay_mode
         self.btn_play_replay.setEnabled(replay_active)
-        self.btn_play_replay.setText("Play  ▶" if self.paused or not replay_active else "Pause  ❚❚")
+        self.set_replay_button_state(replay_active and not self.paused)
         self.replay_slider.setEnabled(replay_active)
         self.replay_speed_slider.setEnabled(replay_active)
         self.btn_step.setEnabled(replay_active)
+        self.update_recording_status()
         self.sync_focus_controls()
+
+    def update_recording_status(self):
+        recorder = self.session_recorder
+        self.lbl_recording_status.setVisible(recorder is not None)
+        if recorder is not None:
+            self.lbl_recording_status.setText(f'● Recording · {recorder.sample_count:,} samples · {recorder.duration_s:.1f} s')
+
+    def set_replay_button_state(self, playing):
+        self.btn_play_replay.setText('Pause' if playing else 'Play  ▶')
+        self.btn_play_replay.setIcon(self.replay_pause_icon if playing else QIcon())
 
     def change_3d_model(self, index):
         factories = [create_aircraft_mesh, create_satellite_mesh, create_drone_mesh]
@@ -1199,12 +1320,14 @@ class TelemetryDashboard(QMainWindow):
             return
         if self.worker is None or self.is_replay_mode:
             return
-        default_name = "telemetry_session.csv"
+        default_name = "telemetry_session.zip"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save telemetry session", default_name, "Telemetry session (*.csv)"
+            self, "Save telemetry session", default_name, "Telemetry session ZIP (*.zip)"
         )
         if not path:
             return
+        if not path.lower().endswith('.zip'):
+            path += '.zip'
         self.start_recording_at_path(path)
 
     def start_recording_at_path(self, path):
@@ -1232,7 +1355,7 @@ class TelemetryDashboard(QMainWindow):
         # known estimator/event state means reconstructed playback produces the
         # same state evolution rather than inheriting an unseen live history.
         self.reset_visual_session()
-        self.log_message(f"SYS >> RECORDING STARTED · {self.session_recorder.csv_path.name}")
+        self.log_message(f"SYS >> RECORDING STARTED · {(self.session_recorder.archive_path or self.session_recorder.csv_path).name}")
         self.set_session_controls()
         return True
 
@@ -1244,23 +1367,24 @@ class TelemetryDashboard(QMainWindow):
             manifest = recorder.close({"source_end_reason": reason})
             self.log_message(f"SYS >> RECORDING SAVED · {recorder.sample_count} SAMPLES · {manifest.name}")
         except OSError as error:
-            self.log_message(f"WARN >> RECORDING FINALIZE FAILED · {error}")
+            self.log_message(f"WARN >> RECORDING FINALIZE FAILED · {error} · RECOVERY FILES: {recorder.csv_path.parent}")
         self.set_session_controls()
 
     def open_session(self):
+        if self.session_recorder is not None:
+            return
+        picker = SessionImportDialog(self)
+        if not picker.exec() or picker.session is None:
+            return
+        session = picker.session
+        self.focus_overlay.restore()
         if self.worker is not None:
-            return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open telemetry session", "", "Telemetry session (*.csv *.json)"
-        )
-        if not path:
-            return
-        try:
-            self.loaded_session = load_session(path)
-        except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "Session Load Failed", str(error))
-            return
-        self.start_replay(self.loaded_session)
+            # A slow serial shutdown can finish after the normal wait expires.
+            # Defer replay until the old worker's cleanup has completed.
+            self.worker.finished.connect(lambda selected=session: QTimer.singleShot(0, lambda: self.start_replay(selected)))
+            self.disconnect_source()
+        if self.worker is None:
+            self.start_replay(session)
 
     def restart_replay(self):
         if isinstance(self.worker, ReplayWorker):
@@ -1324,7 +1448,7 @@ class TelemetryDashboard(QMainWindow):
         else:
             self.paused = True
         self.worker.set_paused(self.paused)
-        self.btn_play_replay.setText("Play  ▶" if self.paused else "Pause  ❚❚")
+        self.set_replay_button_state(not self.paused)
         self.sync_focus_controls()
         self.log_message(f"SYS >> REPLAY {'PAUSED' if self.paused else 'PLAYING'}")
 
@@ -1338,7 +1462,8 @@ class TelemetryDashboard(QMainWindow):
         if isinstance(self.worker, ReplayWorker):
             self.worker.request_step()
             self.paused = True
-            self.btn_play_replay.setText("Play  ▶")
+            self.set_replay_button_state(False)
+            self.sync_focus_controls()
 
     def begin_replay_step(self):
         self.replay_step_in_flight = True
@@ -1353,6 +1478,7 @@ class TelemetryDashboard(QMainWindow):
         if self.loaded_session is not None:
             target = self.loaded_session.duration_s * value / self.replay_slider.maximum()
             self.lbl_replay_time.setText(f"Seek to {target:.2f} / {self.loaded_session.duration_s:.2f} s")
+            self.sync_chart_replay_time(preview=target)
 
     def commit_replay_seek(self):
         self.replay_seeking = False
@@ -1391,6 +1517,8 @@ class TelemetryDashboard(QMainWindow):
         self.lbl_replay_time.setText(
             f"Replay {position_s:.2f} / {duration_s:.2f} s · {self.replay_speeds[self.replay_speed_slider.value()]:g}×"
         )
+        if not self.replay_seeking:
+            self.sync_chart_replay_time()
 
     def disconnect_source(self):
         self.live_fault_kind = None
@@ -1601,6 +1729,7 @@ class TelemetryDashboard(QMainWindow):
                     event.peak_g if event is not None else None,
                     event.axis if event is not None else "",
                 ))
+                self.update_recording_status()
             except OSError as error:
                 self.log_message(f"WARN >> RECORDING WRITE FAILED · {error}")
                 self.stop_recording()
@@ -1645,6 +1774,7 @@ class TelemetryDashboard(QMainWindow):
         self.lbl_angles.setText(f"Pitch  {motion.pitch:+.1f}°     Roll  {motion.roll:+.1f}°     Yaw  {motion.yaw:+.1f}°")
 
     def update_stats(self, now):
+        self.update_recording_status()
         while self.frame_timestamps and now - self.frame_timestamps[0] > 1:
             self.frame_timestamps.popleft()
         running = self.worker is not None and self.worker.isRunning()

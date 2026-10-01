@@ -10,6 +10,9 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import csv
 import json
+import io
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -75,7 +78,15 @@ class SessionRecorder:
     """Append samples to a line-buffered CSV and finalize its JSON manifest."""
 
     def __init__(self, path: str | Path, metadata: dict[str, Any]) -> None:
-        self.csv_path, self.metadata_path = session_paths(path)
+        selected = Path(path)
+        self.archive_path = selected if selected.suffix.lower() == '.zip' else None
+        self._staging = None
+        if self.archive_path is not None:
+            selected.parent.mkdir(parents=True, exist_ok=True)
+            # Keep a flushed CSV on disk during recording, including on failure.
+            self._staging = Path(tempfile.mkdtemp(prefix='.telemetry-recording-', dir=selected.parent))
+            selected = self._staging / selected.with_suffix('.csv').name
+        self.csv_path, self.metadata_path = session_paths(selected)
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         self._metadata = dict(metadata)
         self._metadata.update({
@@ -90,6 +101,10 @@ class SessionRecorder:
         self._first_timestamp_s = None
         self._last_timestamp_s = 0.0
         self._closed = False
+
+    @property
+    def duration_s(self) -> float:
+        return self._last_timestamp_s
 
     def write(self, sample: SessionSample) -> None:
         if self._closed:
@@ -109,7 +124,7 @@ class SessionRecorder:
 
     def close(self, extra_metadata: dict[str, Any] | None = None) -> Path:
         if self._closed:
-            return self.metadata_path
+            return self.archive_path or self.metadata_path
         self._file.close()
         self._closed = True
         manifest = dict(self._metadata)
@@ -120,28 +135,63 @@ class SessionRecorder:
         self.metadata_path.write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        if self.archive_path is not None:
+            pending = self._staging / 'session.pending.zip'
+            # Stored entries also open directly in the dependency-free browser demo.
+            with zipfile.ZipFile(pending, 'w', compression=zipfile.ZIP_STORED) as archive:
+                archive.write(self.csv_path, self.csv_path.name)
+                archive.write(self.metadata_path, self.metadata_path.name)
+            pending.replace(self.archive_path)
+            self.csv_path.unlink()
+            self.metadata_path.unlink()
+            self._staging.rmdir()
+            return self.archive_path
         return self.metadata_path
 
 
-def load_session(path: str | Path) -> Session:
-    csv_path, metadata_path = session_paths(path)
+def load_session(path: str | Path, metadata_path: str | Path | None = None) -> Session:
+    selected = Path(path)
+    if selected.suffix.lower() == '.zip':
+        try:
+            with zipfile.ZipFile(selected) as archive:
+                entries = archive.infolist()
+                if len(entries) != 2 or any(entry.is_dir() or entry.file_size > 64 * 1024 * 1024 for entry in entries):
+                    raise SessionFormatError('Choose a session ZIP containing one CSV and one JSON (maximum 64 MB each).')
+                csv_entries = [entry for entry in entries if entry.filename.lower().endswith('.csv')]
+                json_entries = [entry for entry in entries if entry.filename.lower().endswith('.json')]
+                if len(csv_entries) != 1 or len(json_entries) != 1:
+                    raise SessionFormatError('Session ZIP must contain exactly one CSV and one JSON.')
+                # Read in memory; archive paths are never extracted to disk.
+                csv_text = archive.read(csv_entries[0]).decode('utf-8-sig')
+                metadata_text = archive.read(json_entries[0]).decode('utf-8-sig')
+                return _load_session_text(csv_text, metadata_text, Path(csv_entries[0].filename).name, selected)
+        except (zipfile.BadZipFile, UnicodeError, RuntimeError, NotImplementedError) as error:
+            raise SessionFormatError(f'Cannot read session ZIP: {error}') from error
+    csv_path, default_metadata = session_paths(selected)
+    metadata_path = Path(metadata_path) if metadata_path is not None else default_metadata
     if not csv_path.is_file():
         raise SessionFormatError(f"Session data file not found: {csv_path}")
     if not metadata_path.is_file():
         raise SessionFormatError(f"Session metadata file not found: {metadata_path}")
+    return _load_session_text(csv_path.read_text(encoding='utf-8-sig'), metadata_path.read_text(encoding='utf-8-sig'), csv_path.name, csv_path)
+
+
+def _load_session_text(csv_text, metadata_text, csv_name, session_path):
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata = json.loads(metadata_text)
     except (OSError, json.JSONDecodeError) as error:
         raise SessionFormatError(f"Cannot read session metadata: {error}") from error
+    if not isinstance(metadata, dict):
+        raise SessionFormatError('Session metadata must be a JSON object')
     if metadata.get("format_version") != FORMAT_VERSION:
         raise SessionFormatError(
             f"Unsupported session format {metadata.get('format_version')!r}; expected {FORMAT_VERSION}"
         )
-    if metadata.get("csv_file") not in (None, csv_path.name):
+    if metadata.get("csv_file") not in (None, csv_name):
         raise SessionFormatError("Metadata points to a different CSV file")
 
     try:
-        with csv_path.open(newline="", encoding="utf-8") as file:
+        with io.StringIO(csv_text, newline='') as file:
             reader = csv.DictReader(file)
             if reader.fieldnames is None or set(CSV_COLUMNS) - set(reader.fieldnames):
                 raise SessionFormatError("Session CSV is missing required columns")
@@ -159,7 +209,7 @@ def load_session(path: str | Path) -> Session:
     declared_count = metadata.get("sample_count")
     if declared_count is not None and declared_count != len(samples):
         raise SessionFormatError("Session metadata sample count does not match CSV")
-    return Session(csv_path, metadata, samples)
+    return Session(session_path, metadata, samples)
 
 
 def _parse_row(row: dict[str, str], row_number: int) -> SessionSample:
