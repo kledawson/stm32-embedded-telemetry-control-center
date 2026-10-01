@@ -2,6 +2,9 @@
 
 An end-to-end motion telemetry project for the **Nucleo STM32F401RE** and **MPU6050**. FreeRTOS firmware streams checksummed sensor data to a Python console for plots, 3D attitude, recording, and fault diagnosis. **Demo mode runs without hardware.**
 
+**[Try the interactive browser demo →](https://kledawson.github.io/stm32-embedded-telemetry-control-center/)**  
+No installation or hardware required. Explore 3D simulation, live plots, recording and replay, fault injection, and calibration with simulated telemetry. For real sensor data, use the desktop app below.
+
 ![Desktop dashboard connected to the live sensor on COM3](docs/media/dashboard-live.png)
 
 *Live COM3 telemetry during board movement: 30-second plots, 3D attitude, and motion events.*
