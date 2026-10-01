@@ -62,6 +62,10 @@
 .memory-simulation-label{color:#ebc66d;font-size:10px;font-weight:600;line-height:1.5;margin:3px 0}#memory-status{line-height:1.5;margin:3px 0}#cal-faces button{font-variant-numeric:tabular-nums}
 #memory-dump-dialog{width:640px;max-width:calc(100vw - 32px);max-height:85dvh;padding:20px;background:#151c28;color:#edf3fa;border:1px solid #637e90;border-radius:10px;overflow:auto}#memory-dump-dialog::backdrop{background:#02050ccc}#memory-dump-dialog .memory-simulation-label{margin:16px 0 10px}#memory-dump-summary{font-size:15px;font-weight:500;margin:10px 0}#memory-dump-dialog pre{background:#0f151e;border:1px solid #293444;border-radius:6px;padding:12px;font:12px/1.8 Consolas,monospace;overflow:auto;color:#a9c8bd}#memory-dump-dialog details{margin-bottom:16px}#memory-dump-dialog summary{cursor:pointer;font-size:11px;color:#a9bbcb}
 .simulation-overlay-body{display:flex;flex-direction:column;gap:10px;padding:12px}.simulation-overlay-body label{font-size:10px;font-weight:600;letter-spacing:.6px;color:#a9bbcb}#focus-controls .simulation-overlay-body select{width:100%;min-width:0;min-height:36px}#focus-controls .simulation-overlay-body button{width:100%;min-height:36px}.simulation-overlay-body [data-stl-status]{font-size:11px;color:#a9bbcb;line-height:1.5;overflow-wrap:anywhere}.simulation-overlay-body [data-stl-status]:empty{display:none}.chart-focus-controls.minimized>:not(.chart-overlay-header){display:none!important}.chart-focus-controls.minimized .chart-collapse::before{content:'';display:inline-block;width:9px;height:9px;border:1px solid currentColor}
+/* Keep mobile browsers from inflating terminal text before controls trigger a reflow.
+   Inherited by log spans in both normal and expanded views; browser zoom still works. */
+.terminal-display,.terminal-placeholder{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+
 /* Match desktop category colors, with muted timestamps and readable full lines. */
 .terminal-line.category-SYS{--terminal-color:#a6bcff}
 .terminal-line.category-TEL{--terminal-color:#77d9df}
